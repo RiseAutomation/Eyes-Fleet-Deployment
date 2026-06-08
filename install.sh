@@ -42,7 +42,9 @@ VERSION="${3:-${EYES_IMAGE_TAG:-latest}}"
 PLATFORM="${EYES_PLATFORM:-linux/amd64}"
 EYES_HOME="${EYES_HOME:-$HOME/eyes}"
 PROJECT="${EYES_DOPPLER_PROJECT:-eyes}"
-CONFIG="${EYES_DOPPLER_CONFIG:-prd_${FACTORY}}"
+# One shared config holds the fleet's secrets (GHCR pull creds + M2M ingest
+# creds); the factory is a non-secret arg, not part of the token's scope.
+CONFIG="${EYES_DOPPLER_CONFIG:-prd_fleet}"
 IMAGE="ghcr.io/riseautomation/eyes-app:${VERSION}"
 DOPPLER_IMAGE="dopplerhq/cli:latest"
 COMPOSE="docker/docker-compose.yml"
@@ -61,10 +63,13 @@ echo "==> Fetching ${PROJECT}/${CONFIG} secrets (doppler-in-docker)…"
 docker run --rm -e DOPPLER_TOKEN="$TOKEN" "$DOPPLER_IMAGE" \
   secrets download --no-file --format env -p "$PROJECT" -c "$CONFIG" > "$EYES_HOME/.env"
 chmod 600 "$EYES_HOME/.env"
-# The factory arg is the source of truth for selection; ensure it's present.
+# The factory comes from the arg (the shared config has no EYES_FACTORY).
 grep -q '^EYES_FACTORY=' "$EYES_HOME/.env" || echo "EYES_FACTORY=$FACTORY" >> "$EYES_HOME/.env"
 # Pin the tag compose pulls to exactly what we resolved/pulled (last wins).
 echo "EYES_IMAGE_TAG=$VERSION" >> "$EYES_HOME/.env"
+# Optional rec-dir overrides for dev boxes (real nodes default to /mnt/storage/rec).
+[ -n "${EYES_REC_HOST:-}" ] && echo "EYES_REC_HOST=$EYES_REC_HOST" >> "$EYES_HOME/.env"
+[ -n "${EYES_REC_CONTAINER:-}" ] && echo "EYES_REC_CONTAINER=$EYES_REC_CONTAINER" >> "$EYES_HOME/.env"
 
 # Load secrets for the GHCR login below (stays in this shell only).
 set -a; . "$EYES_HOME/.env"; set +a
