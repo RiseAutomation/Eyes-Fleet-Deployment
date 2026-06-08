@@ -42,8 +42,10 @@ VERSION="${3:-${EYES_IMAGE_TAG:-latest}}"
 PLATFORM="${EYES_PLATFORM:-linux/amd64}"
 EYES_HOME="${EYES_HOME:-$HOME/eyes}"
 PROJECT="${EYES_DOPPLER_PROJECT:-eyes}"
-# One shared config holds the fleet's secrets (GHCR pull creds + M2M ingest
-# creds); the factory is a non-secret arg, not part of the token's scope.
+# One shared config (the universal token's only gate) holds the fleet's GHCR
+# pull creds plus EVERY factory's M2M identity, namespaced EYES_M2M_CLIENT_ID_<FACTORY>.
+# We pull the bundle, then write ONLY this factory's M2M to the node — so each
+# node still authenticates to the hub as its own per-factory Auth0 client.
 CONFIG="${EYES_DOPPLER_CONFIG:-prd_fleet}"
 IMAGE="ghcr.io/riseautomation/eyes-app:${VERSION}"
 DOPPLER_IMAGE="dopplerhq/cli:latest"
@@ -57,19 +59,37 @@ umask 077
 mkdir -p "$EYES_HOME"
 cd "$EYES_HOME"
 
-# 1. Fetch config+secrets from Doppler using the official CLI as a container.
-#    Token via env (never argv/ps). Output is .env format -> write straight to .env.
+# 1. Fetch the shared bundle from Doppler via the official CLI as a container.
+#    Token via env (never argv/ps). Keep it in memory; we write a curated .env.
 echo "==> Fetching ${PROJECT}/${CONFIG} secrets (doppler-in-docker)…"
-docker run --rm -e DOPPLER_TOKEN="$TOKEN" "$DOPPLER_IMAGE" \
-  secrets download --no-file --format env -p "$PROJECT" -c "$CONFIG" > "$EYES_HOME/.env"
+RAW="$(docker run --rm -e DOPPLER_TOKEN="$TOKEN" "$DOPPLER_IMAGE" \
+  secrets download --no-file --format env -p "$PROJECT" -c "$CONFIG")"
+
+# Read a KEY="value" entry from the env-format blob (strips surrounding quotes).
+getval() { printf '%s\n' "$RAW" | sed -n "s/^$1=//p" | head -1 | sed -e 's/^"//' -e 's/"$//'; }
+
+FU="$(printf '%s' "$FACTORY" | tr '[:lower:]' '[:upper:]')"
+M2M_ID="$(getval "EYES_M2M_CLIENT_ID_${FU}")"
+M2M_SECRET="$(getval "EYES_M2M_CLIENT_SECRET_${FU}")"
+if [[ -z "$M2M_ID" || -z "$M2M_SECRET" ]]; then
+  echo "ERROR: no M2M creds for factory '$FACTORY' in $CONFIG (expected EYES_M2M_CLIENT_ID_${FU})." >&2
+  exit 1
+fi
+
+# Write a curated .env: shared GHCR + ONLY this factory's M2M (other factories'
+# M2M never touch this node). The factory is the arg; tag is what we pin/pull.
+{
+  echo "GHCR_USERNAME=$(getval GHCR_USERNAME)"
+  echo "GHCR_PAT=$(getval GHCR_PAT)"
+  echo "EYES_M2M_CLIENT_ID=$M2M_ID"
+  echo "EYES_M2M_CLIENT_SECRET=$M2M_SECRET"
+  echo "EYES_FACTORY=$FACTORY"
+  echo "EYES_IMAGE_TAG=$VERSION"
+  # Optional rec-dir overrides for dev boxes (real nodes default to /mnt/storage/rec).
+  [ -n "${EYES_REC_HOST:-}" ] && echo "EYES_REC_HOST=$EYES_REC_HOST"
+  [ -n "${EYES_REC_CONTAINER:-}" ] && echo "EYES_REC_CONTAINER=$EYES_REC_CONTAINER"
+} > "$EYES_HOME/.env"
 chmod 600 "$EYES_HOME/.env"
-# The factory comes from the arg (the shared config has no EYES_FACTORY).
-grep -q '^EYES_FACTORY=' "$EYES_HOME/.env" || echo "EYES_FACTORY=$FACTORY" >> "$EYES_HOME/.env"
-# Pin the tag compose pulls to exactly what we resolved/pulled (last wins).
-echo "EYES_IMAGE_TAG=$VERSION" >> "$EYES_HOME/.env"
-# Optional rec-dir overrides for dev boxes (real nodes default to /mnt/storage/rec).
-[ -n "${EYES_REC_HOST:-}" ] && echo "EYES_REC_HOST=$EYES_REC_HOST" >> "$EYES_HOME/.env"
-[ -n "${EYES_REC_CONTAINER:-}" ] && echo "EYES_REC_CONTAINER=$EYES_REC_CONTAINER" >> "$EYES_HOME/.env"
 
 # Load secrets for the GHCR login below (stays in this shell only).
 set -a; . "$EYES_HOME/.env"; set +a
