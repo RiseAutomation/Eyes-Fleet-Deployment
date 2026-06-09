@@ -26,7 +26,7 @@
 #   3. Rehydrate the working dir from the image (compose + config + metadata).
 #   4. Write .env and `docker compose up -d`.
 #
-# Tunables (env): EYES_HOME (default ~/eyes), EYES_IMAGE_TAG (default latest),
+# Tunables (env): EYES_HOME (default: current dir), EYES_IMAGE_TAG (default latest),
 #   EYES_DOPPLER_PROJECT (default eyes), EYES_DOPPLER_CONFIG (default prd_<factory>).
 #
 set -euo pipefail
@@ -41,7 +41,7 @@ VERSION="${3:-${EYES_IMAGE_TAG:-latest}}"
 # CI publishes linux/amd64. Real nodes are amd64; an Apple-Silicon dev box runs
 # it under emulation. Matches the compose platform pin.
 PLATFORM="${EYES_PLATFORM:-linux/amd64}"
-EYES_HOME="${EYES_HOME:-$HOME/eyes}"
+EYES_HOME="${EYES_HOME:-$(pwd)}"
 PROJECT="${EYES_DOPPLER_PROJECT:-eyes}"
 # One shared config (the universal token's only gate) holds the fleet secrets:
 # the GHCR pull creds and the single shared M2M client (Rise issued ONE M2M
@@ -79,9 +79,13 @@ echo "==> Fetching ${PROJECT}/${CONFIG} secrets (doppler-in-docker)…"
 $DOCKER run --rm -e DOPPLER_TOKEN="$TOKEN" "$DOPPLER_IMAGE" \
   secrets download --no-file --format env -p "$PROJECT" -c "$CONFIG" > "$EYES_HOME/.env"
 chmod 600 "$EYES_HOME/.env"
-# The factory is the arg (the shared config has no EYES_FACTORY); pin the image
-# tag so compose pulls what we pulled; optional rec overrides for dev boxes.
-grep -q '^EYES_FACTORY=' "$EYES_HOME/.env" || echo "EYES_FACTORY=$FACTORY" >> "$EYES_HOME/.env"
+# The factory comes from the CLI arg and is AUTHORITATIVE: strip any EYES_FACTORY
+# the shared config may carry (prd_fleet was derived from the old per-site
+# configs, which set it) so a stale value can't silently override the arg and
+# pin the node to the wrong factory. Then pin the image tag so compose pulls what
+# we pulled; optional rec overrides for dev boxes.
+sed -i.bak '/^EYES_FACTORY=/d' "$EYES_HOME/.env" && rm -f "$EYES_HOME/.env.bak"
+echo "EYES_FACTORY=$FACTORY" >> "$EYES_HOME/.env"
 echo "EYES_IMAGE_TAG=$VERSION" >> "$EYES_HOME/.env"
 [ -n "${EYES_REC_HOST:-}" ] && echo "EYES_REC_HOST=$EYES_REC_HOST" >> "$EYES_HOME/.env"
 [ -n "${EYES_REC_CONTAINER:-}" ] && echo "EYES_REC_CONTAINER=$EYES_REC_CONTAINER" >> "$EYES_HOME/.env"
