@@ -73,25 +73,33 @@ umask 077
 mkdir -p "$EYES_HOME"
 cd "$EYES_HOME"
 
+# Compose auto-loads .env from the COMPOSE FILE'S directory (the "project
+# directory"), NOT the cwd. Our compose file lives in $EYES_HOME/docker, so the
+# .env must sit beside it — otherwise `docker compose -f docker/...` (manual or
+# scripted) silently ignores it and every ${VAR:-default} falls back (e.g.
+# EYES_FACTORY -> temp). Write it there so any invocation picks it up.
+ENV_FILE="$EYES_HOME/docker/.env"
+mkdir -p "$EYES_HOME/docker"
+
 # 1. Fetch the shared config from Doppler via the official CLI as a container.
 #    Token via env (never argv/ps). Output is .env format -> write straight to .env.
 echo "==> Fetching ${PROJECT}/${CONFIG} secrets (doppler-in-docker)…"
 $DOCKER run --rm -e DOPPLER_TOKEN="$TOKEN" "$DOPPLER_IMAGE" \
-  secrets download --no-file --format env -p "$PROJECT" -c "$CONFIG" > "$EYES_HOME/.env"
-chmod 600 "$EYES_HOME/.env"
+  secrets download --no-file --format env -p "$PROJECT" -c "$CONFIG" > "$ENV_FILE"
+chmod 600 "$ENV_FILE"
 # The factory comes from the CLI arg and is AUTHORITATIVE: strip any EYES_FACTORY
 # the shared config may carry (prd_fleet was derived from the old per-site
 # configs, which set it) so a stale value can't silently override the arg and
 # pin the node to the wrong factory. Then pin the image tag so compose pulls what
 # we pulled; optional rec overrides for dev boxes.
-sed -i.bak '/^EYES_FACTORY=/d' "$EYES_HOME/.env" && rm -f "$EYES_HOME/.env.bak"
-echo "EYES_FACTORY=$FACTORY" >> "$EYES_HOME/.env"
-echo "EYES_IMAGE_TAG=$VERSION" >> "$EYES_HOME/.env"
-[ -n "${EYES_REC_HOST:-}" ] && echo "EYES_REC_HOST=$EYES_REC_HOST" >> "$EYES_HOME/.env"
-[ -n "${EYES_REC_CONTAINER:-}" ] && echo "EYES_REC_CONTAINER=$EYES_REC_CONTAINER" >> "$EYES_HOME/.env"
+sed -i.bak '/^EYES_FACTORY=/d' "$ENV_FILE" && rm -f "$ENV_FILE.bak"
+echo "EYES_FACTORY=$FACTORY" >> "$ENV_FILE"
+echo "EYES_IMAGE_TAG=$VERSION" >> "$ENV_FILE"
+[ -n "${EYES_REC_HOST:-}" ] && echo "EYES_REC_HOST=$EYES_REC_HOST" >> "$ENV_FILE"
+[ -n "${EYES_REC_CONTAINER:-}" ] && echo "EYES_REC_CONTAINER=$EYES_REC_CONTAINER" >> "$ENV_FILE"
 
 # Load secrets for the GHCR login below (stays in this shell only).
-set -a; . "$EYES_HOME/.env"; set +a
+set -a; . "$ENV_FILE"; set +a
 
 # 2. GHCR auth + pull.
 echo "==> Authenticating to GHCR and pulling $IMAGE …"
