@@ -14,7 +14,8 @@
 #   [version]        Optional image tag to pin, e.g. v0.0.3. Defaults to
 #                    `latest`, which CI keeps pointed at the newest v* build.
 #
-# Requirements: docker (with the compose plugin) and a reachable daemon. That's
+# Requirements: docker (with the compose plugin). The daemon is reached directly
+# if possible, else via sudo (when the user isn't in the docker group). That's
 # it — the Doppler CLI runs as a container, and the app image carries the code,
 # config, ML model, compose file, and factory metadata.
 #
@@ -53,7 +54,19 @@ DOPPLER_IMAGE="dopplerhq/cli:latest"
 COMPOSE="docker/docker-compose.yml"
 
 command -v docker >/dev/null 2>&1 || { echo "ERROR: docker is required." >&2; exit 1; }
-docker info >/dev/null 2>&1 || { echo "ERROR: docker daemon is not reachable." >&2; exit 1; }
+# Use docker directly if we can reach the daemon; otherwise fall back to sudo
+# (this user isn't in the docker group). Probe once; all docker calls below go
+# through $DOCKER. sudo may prompt for a password on first use.
+DOCKER="docker"
+if ! docker info >/dev/null 2>&1; then
+  if command -v sudo >/dev/null 2>&1 && sudo docker info >/dev/null 2>&1; then
+    DOCKER="sudo docker"
+    echo "==> docker needs elevated permissions here; using 'sudo docker'."
+  else
+    echo "ERROR: docker daemon is not reachable (tried with and without sudo)." >&2
+    exit 1
+  fi
+fi
 
 echo "==> Eyes node install: factory=$FACTORY  home=$EYES_HOME"
 umask 077
@@ -63,7 +76,7 @@ cd "$EYES_HOME"
 # 1. Fetch the shared config from Doppler via the official CLI as a container.
 #    Token via env (never argv/ps). Output is .env format -> write straight to .env.
 echo "==> Fetching ${PROJECT}/${CONFIG} secrets (doppler-in-docker)…"
-docker run --rm -e DOPPLER_TOKEN="$TOKEN" "$DOPPLER_IMAGE" \
+$DOCKER run --rm -e DOPPLER_TOKEN="$TOKEN" "$DOPPLER_IMAGE" \
   secrets download --no-file --format env -p "$PROJECT" -c "$CONFIG" > "$EYES_HOME/.env"
 chmod 600 "$EYES_HOME/.env"
 # The factory is the arg (the shared config has no EYES_FACTORY); pin the image
@@ -79,19 +92,19 @@ set -a; . "$EYES_HOME/.env"; set +a
 # 2. GHCR auth + pull.
 echo "==> Authenticating to GHCR and pulling $IMAGE …"
 if [[ -n "${GHCR_PAT:-}" ]]; then
-  printf '%s' "$GHCR_PAT" | docker login ghcr.io -u "${GHCR_USERNAME:-x-access-token}" --password-stdin
+  printf '%s' "$GHCR_PAT" | $DOCKER login ghcr.io -u "${GHCR_USERNAME:-x-access-token}" --password-stdin
 fi
-docker pull --platform "$PLATFORM" "$IMAGE"
+$DOCKER pull --platform "$PLATFORM" "$IMAGE"
 
 # 3. Rehydrate the working dir from the image (no git): compose + config + metadata.
 #    The ML model lives inside the baked eyes/ package, so nothing else is needed.
 echo "==> Extracting compose + config + metadata from the image…"
-cid="$(docker create --platform "$PLATFORM" "$IMAGE")"
-trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+cid="$($DOCKER create --platform "$PLATFORM" "$IMAGE")"
+trap '$DOCKER rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 mkdir -p "$EYES_HOME/docker" "$EYES_HOME/config" "$EYES_HOME/data"
-docker cp "$cid:/app/$COMPOSE" "$EYES_HOME/$COMPOSE"
-docker cp "$cid:/app/config/." "$EYES_HOME/config/"
-if ! docker cp "$cid:/app/data/metadata" "$EYES_HOME/data/" 2>/dev/null; then
+$DOCKER cp "$cid:/app/$COMPOSE" "$EYES_HOME/$COMPOSE"
+$DOCKER cp "$cid:/app/config/." "$EYES_HOME/config/"
+if ! $DOCKER cp "$cid:/app/data/metadata" "$EYES_HOME/data/" 2>/dev/null; then
   echo "WARNING: image has no baked data/metadata. Rebuild the image after the" >&2
   echo "         .dockerignore change (data/* + !data/metadata) or the worker" >&2
   echo "         will find no cameras to scan." >&2
@@ -100,6 +113,6 @@ mkdir -p "$EYES_HOME/data/bucket" "$EYES_HOME/data/workdir" "$EYES_HOME/rec"
 
 # 4. Launch (compose pulls redis as needed; eyes-app is already local).
 echo "==> Starting the stack…"
-docker compose -f "$COMPOSE" up -d
+$DOCKER compose -f "$COMPOSE" up -d
 echo "==> Node up for factory '$FACTORY'."
-echo "    Logs:  docker compose -f $EYES_HOME/$COMPOSE logs -f tasks"
+echo "    Logs:  $DOCKER compose -f $EYES_HOME/$COMPOSE logs -f tasks"
