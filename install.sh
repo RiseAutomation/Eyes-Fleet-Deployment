@@ -97,6 +97,15 @@ echo "EYES_FACTORY=$FACTORY" >> "$ENV_FILE"
 echo "EYES_IMAGE_TAG=$VERSION" >> "$ENV_FILE"
 [ -n "${EYES_REC_HOST:-}" ] && echo "EYES_REC_HOST=$EYES_REC_HOST" >> "$ENV_FILE"
 [ -n "${EYES_REC_CONTAINER:-}" ] && echo "EYES_REC_CONTAINER=$EYES_REC_CONTAINER" >> "$ENV_FILE"
+# Per-node machine id: seeds the node-general queue that this node's general
+# workers share, so node-local work (commit aggregation, which writes the local
+# bucket) runs on this node but off the dedicated inference workers. Unique per
+# node so it never collides if nodes are ever pointed at a shared broker. Lives
+# in .env, so it's stable across `compose up`/restarts; a reinstall rotates it
+# (harmless — the local filesystem is the source of truth for commits). Set
+# EYES_MACHINE_ID in the Doppler config to pin a fixed value instead.
+grep -q '^EYES_MACHINE_ID=' "$ENV_FILE" || \
+  echo "EYES_MACHINE_ID=node-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')" >> "$ENV_FILE"
 
 # Load secrets for the GHCR login below (stays in this shell only).
 set -a; . "$ENV_FILE"; set +a
