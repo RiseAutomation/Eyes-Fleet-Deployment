@@ -2,17 +2,23 @@
 #
 # Eyes node installer — docker-only. No root, no git clone, no host doppler.
 #
-#   curl -fsSL https://<your-host>/install.sh | bash -s -- <doppler-token> <factory> [version]
+#   curl -fsSL https://<your-host>/install.sh | bash -s -- <doppler-token> <factory-id> [version]
 #
 # Args:
-#   <doppler-token>  A Doppler token that can read the eyes project's
-#                    prd_<factory> config (a temporary universal/service-account
-#                    token, or that site's service token). Used in-memory only;
+#   <doppler-token>  A Doppler token that can read the eyes project's shared
+#                    prd_fleet config (a temporary universal/service-account
+#                    token, or a site service token). Used in-memory only;
 #                    never written to disk.
-#   <factory>        Factory name, e.g. contempo / rapidbloc / temp. Selects the
-#                    Doppler config (prd_<factory>) and the active factory.
+#   <factory-id>     The node's hub factory id (a UUID). Becomes the node's
+#                    identity: written as EYES_FACTORY_ID and consumed by the
+#                    config as factory.uuid (+ celery worker location). There are
+#                    no per-factory config files — a new factory just installs
+#                    with its id. Secrets come from the shared prd_fleet config.
 #   [version]        Optional image tag to pin, e.g. v0.0.3. Defaults to
 #                    `latest`, which CI keeps pointed at the newest v* build.
+#
+# Deployment profile: `onsite` by default (real nodes). Override with
+# EYES_PROFILE=dev for a laptop/webcam rig (see config/profile/).
 #
 # Requirements: docker (with the compose plugin). The daemon is reached directly
 # if possible, else via sudo (when the user isn't in the docker group). That's
@@ -21,7 +27,7 @@
 #
 # What it does (Model B — secrets provisioned once into a root-readable .env,
 # the bootstrap token is discarded):
-#   1. Pull this factory's config+secrets from Doppler via dopplerhq/cli (docker).
+#   1. Pull the shared fleet config+secrets from Doppler via dopplerhq/cli (docker).
 #   2. docker login GHCR + pull the eyes-app image.
 #   3. Rehydrate the working dir from the image (compose + config + metadata).
 #   4. Write .env and `docker compose up -d`.
@@ -31,11 +37,14 @@
 #
 set -euo pipefail
 
-TOKEN="${1:-}"; FACTORY="${2:-}"
-if [[ -z "$TOKEN" || -z "$FACTORY" ]]; then
-  echo "usage: install.sh <doppler-token> <factory> [version]" >&2
+TOKEN="${1:-}"; FACTORY_ID="${2:-}"
+if [[ -z "$TOKEN" || -z "$FACTORY_ID" ]]; then
+  echo "usage: install.sh <doppler-token> <factory-id> [version]" >&2
   exit 1
 fi
+# Deployment profile (config/profile/<name>.yaml). Real nodes are on-site; a dev
+# laptop/webcam rig passes EYES_PROFILE=dev.
+PROFILE="${EYES_PROFILE:-onsite}"
 
 VERSION="${3:-${EYES_IMAGE_TAG:-latest}}"
 # CI publishes linux/amd64. Real nodes are amd64; an Apple-Silicon dev box runs
@@ -46,8 +55,8 @@ PROJECT="${EYES_DOPPLER_PROJECT:-eyes}"
 # One shared config (the universal token's only gate) holds the fleet secrets:
 # the GHCR pull creds and the single shared M2M client (Rise issued ONE M2M
 # credential for the whole integration; the hub tells factories apart by the
-# factory_uuid in the payload, not by client). The factory is just a non-secret
-# arg that selects which factory yaml the worker runs.
+# factory id in the payload, not by client). The factory id + profile are just
+# non-secret args that set this node's identity and deployment shape.
 CONFIG="${EYES_DOPPLER_CONFIG:-prd_fleet}"
 IMAGE="ghcr.io/riseautomation/eyes-app:${VERSION}"
 DOPPLER_IMAGE="dopplerhq/cli:latest"
@@ -68,7 +77,7 @@ if ! docker info >/dev/null 2>&1; then
   fi
 fi
 
-echo "==> Eyes node install: factory=$FACTORY  home=$EYES_HOME"
+echo "==> Eyes node install: factory-id=$FACTORY_ID  profile=$PROFILE  home=$EYES_HOME"
 umask 077
 mkdir -p "$EYES_HOME"
 cd "$EYES_HOME"
@@ -77,7 +86,7 @@ cd "$EYES_HOME"
 # directory"), NOT the cwd. Our compose file lives in $EYES_HOME/docker, so the
 # .env must sit beside it — otherwise `docker compose -f docker/...` (manual or
 # scripted) silently ignores it and every ${VAR:-default} falls back (e.g.
-# EYES_FACTORY -> temp). Write it there so any invocation picks it up.
+# EYES_PROFILE -> dev). Write it there so any invocation picks it up.
 ENV_FILE="$EYES_HOME/docker/.env"
 mkdir -p "$EYES_HOME/docker"
 
@@ -87,13 +96,14 @@ echo "==> Fetching ${PROJECT}/${CONFIG} secrets (doppler-in-docker)…"
 $DOCKER run --rm -e DOPPLER_TOKEN="$TOKEN" "$DOPPLER_IMAGE" \
   secrets download --no-file --format env -p "$PROJECT" -c "$CONFIG" > "$ENV_FILE"
 chmod 600 "$ENV_FILE"
-# The factory comes from the CLI arg and is AUTHORITATIVE: strip any EYES_FACTORY
-# the shared config may carry (prd_fleet was derived from the old per-site
-# configs, which set it) so a stale value can't silently override the arg and
-# pin the node to the wrong factory. Then pin the image tag so compose pulls what
-# we pulled; optional rec overrides for dev boxes.
-sed -i.bak '/^EYES_FACTORY=/d' "$ENV_FILE" && rm -f "$ENV_FILE.bak"
-echo "EYES_FACTORY=$FACTORY" >> "$ENV_FILE"
+# Identity + profile come from the CLI arg/env and are AUTHORITATIVE: strip any
+# EYES_FACTORY_ID/EYES_PROFILE (and the legacy EYES_FACTORY) the shared config may
+# carry so a stale value can't silently override the arg and pin the node to the
+# wrong factory/shape. Then write the resolved values + pin the image tag so
+# compose pulls what we pulled; optional rec overrides for dev boxes.
+sed -i.bak '/^EYES_FACTORY_ID=/d; /^EYES_PROFILE=/d; /^EYES_FACTORY=/d' "$ENV_FILE" && rm -f "$ENV_FILE.bak"
+echo "EYES_FACTORY_ID=$FACTORY_ID" >> "$ENV_FILE"
+echo "EYES_PROFILE=$PROFILE" >> "$ENV_FILE"
 echo "EYES_IMAGE_TAG=$VERSION" >> "$ENV_FILE"
 [ -n "${EYES_REC_HOST:-}" ] && echo "EYES_REC_HOST=$EYES_REC_HOST" >> "$ENV_FILE"
 [ -n "${EYES_REC_CONTAINER:-}" ] && echo "EYES_REC_CONTAINER=$EYES_REC_CONTAINER" >> "$ENV_FILE"
@@ -115,6 +125,12 @@ echo "==> Authenticating to GHCR and pulling $IMAGE …"
 if [[ -n "${GHCR_PAT:-}" ]]; then
   printf '%s' "$GHCR_PAT" | $DOCKER login ghcr.io -u "${GHCR_USERNAME:-x-access-token}" --password-stdin
 fi
+# The PAT is only needed for this one login; docker persists the credential to
+# its config.json, so the pull below (and future `compose pull` upgrades) reuse
+# it without the PAT. Strip GHCR creds from the on-disk .env so they don't linger
+# at rest on the node — they stay in this shell only (dies at exit). compose
+# doesn't reference them, so nothing downstream breaks.
+sed -i.bak '/^GHCR_PAT=/d; /^GHCR_USERNAME=/d' "$ENV_FILE" && rm -f "$ENV_FILE.bak"
 $DOCKER pull --platform "$PLATFORM" "$IMAGE"
 
 # 3. Rehydrate the working dir from the image (no git): compose + config + metadata.
@@ -132,8 +148,17 @@ if ! $DOCKER cp "$cid:/app/data/metadata" "$EYES_HOME/data/" 2>/dev/null; then
 fi
 mkdir -p "$EYES_HOME/data/bucket" "$EYES_HOME/data/workdir" "$EYES_HOME/rec"
 
+# 3b. Sanity-check the chosen profile now that the config is on disk. Identity
+#     (EYES_FACTORY_ID) needs no lookup — it's the hub id, written verbatim above.
+PROFILE_DIR="$EYES_HOME/config/profile"
+if [[ -d "$PROFILE_DIR" && ! -f "$PROFILE_DIR/$PROFILE.yaml" ]]; then
+  known="$(cd "$PROFILE_DIR" && ls -1 ./*.yaml 2>/dev/null | sed 's#.*/##; s#\.yaml$##' | tr '\n' ' ')"
+  echo "ERROR: no config/profile/$PROFILE.yaml (known: ${known:-none})." >&2
+  exit 1
+fi
+
 # 4. Launch (compose pulls redis as needed; eyes-app is already local).
 echo "==> Starting the stack…"
 $DOCKER compose -f "$COMPOSE" up -d
-echo "==> Node up for factory '$FACTORY'."
+echo "==> Node up: factory-id=$FACTORY_ID profile=$PROFILE."
 echo "    Logs:  $DOCKER compose -f $EYES_HOME/$COMPOSE logs -f tasks"
