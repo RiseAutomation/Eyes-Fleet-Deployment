@@ -23,13 +23,15 @@
 # Requirements: docker (with the compose plugin). The daemon is reached directly
 # if possible, else via sudo (when the user isn't in the docker group). That's
 # it — the Doppler CLI runs as a container, and the app image carries the code,
-# config, ML model, compose file, and factory metadata.
+# config, ML model, and compose file. Site metadata is NOT in the image (A1.5): the
+# node fetches its factory bundle from the control plane at boot.
 #
 # What it does (Model B — secrets provisioned once into a root-readable .env,
 # the bootstrap token is discarded):
 #   1. Pull the shared fleet config+secrets from Doppler via dopplerhq/cli (docker).
 #   2. docker login GHCR + pull the eyes-app image.
-#   3. Rehydrate the working dir from the image (compose + config + metadata).
+#   3. Rehydrate the working dir from the image (compose + config). Site metadata is
+#      NOT baked (A1.5): the node fetches it from the control plane at boot.
 #   4. Write .env and `docker compose up -d`.
 #
 # Tunables (env): EYES_HOME (default: current dir), EYES_IMAGE_TAG (default latest),
@@ -133,20 +135,20 @@ fi
 sed -i.bak '/^GHCR_PAT=/d; /^GHCR_USERNAME=/d' "$ENV_FILE" && rm -f "$ENV_FILE.bak"
 $DOCKER pull --platform "$PLATFORM" "$IMAGE"
 
-# 3. Rehydrate the working dir from the image (no git): compose + config + metadata.
-#    The ML model lives inside the baked eyes/ package, so nothing else is needed.
-echo "==> Extracting compose + config + metadata from the image…"
+# 3. Rehydrate the working dir from the image (no git): compose + config.
+#    The ML model lives inside the baked eyes/ package. Site metadata is NOT baked
+#    (A1.5 / spec M4): the node boots blank and the command-listener fetches this
+#    factory's current bundle from the control plane into data/metadata/ (a cache),
+#    so a reinstall can no longer clobber pushed metadata with a stale git snapshot.
+#    We create an EMPTY data/metadata so the volume mount + the worker gate have a
+#    dir to watch; the fetch fills it (see EYES_METADATA_SOURCE / metadata gate).
+echo "==> Extracting compose + config from the image…"
 cid="$($DOCKER create --platform "$PLATFORM" "$IMAGE")"
 trap '$DOCKER rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 mkdir -p "$EYES_HOME/docker" "$EYES_HOME/config" "$EYES_HOME/data"
 $DOCKER cp "$cid:/app/$COMPOSE" "$EYES_HOME/$COMPOSE"
 $DOCKER cp "$cid:/app/config/." "$EYES_HOME/config/"
-if ! $DOCKER cp "$cid:/app/data/metadata" "$EYES_HOME/data/" 2>/dev/null; then
-  echo "WARNING: image has no baked data/metadata. Rebuild the image after the" >&2
-  echo "         .dockerignore change (data/* + !data/metadata) or the worker" >&2
-  echo "         will find no cameras to scan." >&2
-fi
-mkdir -p "$EYES_HOME/data/bucket" "$EYES_HOME/data/workdir" "$EYES_HOME/rec"
+mkdir -p "$EYES_HOME/data/metadata" "$EYES_HOME/data/bucket" "$EYES_HOME/data/workdir" "$EYES_HOME/rec"
 
 # 3b. Sanity-check the chosen profile now that the config is on disk. Identity
 #     (EYES_FACTORY_ID) needs no lookup — it's the hub id, written verbatim above.
