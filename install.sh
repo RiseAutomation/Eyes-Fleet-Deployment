@@ -4,6 +4,17 @@
 #
 #   curl -fsSL https://<your-host>/install.sh | bash -s -- <doppler-token> <factory-id> [version]
 #
+# First-time node bring-up is a SINGLE call: prefix the one-time enrollment credential
+# (minted with scripts/eyes_device_admin.py) as an env var and the installer enrolls the
+# node's device identity for you (A1) before starting the stack:
+#
+#   EYES_ENROLL_CREDENTIAL=epc-… EYES_DEVICE_DOOR_URL=https://<device-door> \
+#     curl -fsSL https://<your-host>/install.sh | bash -s -- <doppler-token> <factory-id> [version]
+#
+# (Put a leading space before the assignment, or `export` it, so the credential stays out
+# of shell history. It is single-use and consumed server-side, so exposure after enroll is
+# moot.) Reinstalls/upgrades need NO credential — enrollment is idempotent (see step 4).
+#
 # Args:
 #   <doppler-token>  A Doppler token that can read the eyes project's shared
 #                    prd_fleet config (a temporary universal/service-account
@@ -32,10 +43,17 @@
 #   2. docker login GHCR + pull the eyes-app image.
 #   3. Rehydrate the working dir from the image (compose + config). Site metadata is
 #      NOT baked (A1.5): the node fetches it from the control plane at boot.
-#   4. Write .env and `docker compose up -d`.
+#   4. Enroll the device identity (A1) if the node isn't already enrolled: redeem the
+#      one-time EYES_ENROLL_CREDENTIAL at the PUBLIC device door, writing the Ed25519 key
+#      into $EYES_HOME/identity. Idempotent (skipped when already enrolled); omit the
+#      credential to defer enrollment (the stack still starts, but the boot-fetch parks).
+#   5. Write .env and `docker compose up -d`.
 #
 # Tunables (env): EYES_HOME (default: current dir), EYES_IMAGE_TAG (default latest),
-#   EYES_DOPPLER_PROJECT (default eyes), EYES_DOPPLER_CONFIG (default prd_<factory>).
+#   EYES_DOPPLER_PROJECT (default eyes), EYES_DOPPLER_CONFIG (default prd_<factory>),
+#   EYES_ENROLL_CREDENTIAL (one-time device-enroll credential; required only for first
+#   enrollment, unused once enrolled), EYES_DEVICE_DOOR_URL (public device-door base URL;
+#   may instead be carried in the Doppler config — it is not a secret).
 #
 set -euo pipefail
 
@@ -157,6 +175,50 @@ if [[ -d "$PROFILE_DIR" && ! -f "$PROFILE_DIR/$PROFILE.yaml" ]]; then
   known="$(cd "$PROFILE_DIR" && ls -1 ./*.yaml 2>/dev/null | sed 's#.*/##; s#\.yaml$##' | tr '\n' ' ')"
   echo "ERROR: no config/profile/$PROFILE.yaml (known: ${known:-none})." >&2
   exit 1
+fi
+
+# 3c. Device identity (A1) — single-call enrollment. The node authenticates to the
+#     control plane with its OWN Ed25519 identity: the command-listener's boot-fetch
+#     mints a bearer from it, and A2+ token consumers will too. Enrollment lives here so
+#     bringing a node up is ONE install.sh call, and it is IDEMPOTENT:
+#       * identity already on disk  -> leave it (reinstalls/upgrades never re-enroll and
+#         need no credential);
+#       * EYES_ENROLL_CREDENTIAL set -> redeem it at the PUBLIC device door, which writes
+#         the key + door coords into $EYES_HOME/identity (root:root 0600, per keys.py).
+#         The key is generated INSIDE the container and never leaves the box. The
+#         credential is single-use and is piped in on STDIN (never argv or -e) so it can't
+#         leak to `ps`/logs even when $DOCKER is `sudo docker`; the door consumes it on
+#         success.
+#       * neither -> WARN and continue: the stack still starts, but the metadata
+#         boot-fetch parks (backs off) until a later install.sh enrolls it (order is
+#         forgiving by design — spec M3).
+IDENTITY_DIR="$EYES_HOME/identity"
+DOOR_URL="${EYES_DEVICE_DOOR_URL:-}"   # non-secret; may also arrive via the Doppler config sourced above
+mkdir -p "$IDENTITY_DIR"
+if [[ -f "$IDENTITY_DIR/device_key.pem" && -f "$IDENTITY_DIR/device.json" ]]; then
+  echo "==> Device identity already present ($IDENTITY_DIR) — skipping enrollment."
+elif [[ -n "${EYES_ENROLL_CREDENTIAL:-}" ]]; then
+  [[ -n "$DOOR_URL" ]] || { echo "ERROR: EYES_ENROLL_CREDENTIAL is set but no device-door URL. Set EYES_DEVICE_DOOR_URL (env or Doppler config)." >&2; exit 1; }
+  echo "==> Enrolling device identity against ${DOOR_URL} …"
+  if printf '%s\n' "$EYES_ENROLL_CREDENTIAL" | $DOCKER run --rm -i --platform "$PLATFORM" \
+      -e EYES_DEVICE_DOOR_URL="$DOOR_URL" \
+      -e EYES_IDENTITY_DIR=/app/identity \
+      -e EYES_AGENT_VERSION="$VERSION" \
+      -v "$IDENTITY_DIR:/app/identity" \
+      "$IMAGE" \
+      python -m eyes.device_identity.enroll --door-url "$DOOR_URL"; then
+    echo "==> Enrolled — identity written to $IDENTITY_DIR."
+  else
+    echo "ERROR: enrollment failed (see the self-check table above). Mint or reissue a" >&2
+    echo "       credential (scripts/eyes_device_admin.py) and re-run install.sh." >&2
+    exit 1
+  fi
+else
+  echo "WARNING: node is NOT enrolled and no EYES_ENROLL_CREDENTIAL was provided." >&2
+  echo "         The stack will start, but the metadata boot-fetch will PARK until this" >&2
+  echo "         node is enrolled. To enroll, mint a credential —" >&2
+  echo "         scripts/eyes_device_admin.py mint --device-type factory_node --factory-id $FACTORY_ID —" >&2
+  echo "         then re-run install.sh with EYES_ENROLL_CREDENTIAL=epc-… (and EYES_DEVICE_DOOR_URL)." >&2
 fi
 
 # 4. Launch (compose pulls redis as needed; eyes-app is already local).
