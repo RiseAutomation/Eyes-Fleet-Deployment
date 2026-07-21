@@ -2,18 +2,21 @@
 #
 # Eyes node installer — docker-only. No root, no git clone, no host doppler.
 #
-#   curl -fsSL https://<your-host>/install.sh | bash -s -- <doppler-token> <factory-id> [version]
+#   curl -fsSL https://<your-host>/install.sh | bash -s -- <doppler-token> <factory-id> [enroll-credential] [version]
 #
-# First-time node bring-up is a SINGLE call: prefix the one-time enrollment credential
-# (minted with scripts/eyes_device_admin.py) as an env var and the installer enrolls the
-# node's device identity for you (A1) before starting the stack:
+# First-time node bring-up is a SINGLE call: pass the one-time enrollment credential
+# (minted with scripts/eyes_device_admin.py) as the THIRD positional arg — the same shape
+# as the doppler token and factory id — and the installer enrolls the node's device
+# identity for you (A1) before starting the stack:
 #
-#   EYES_ENROLL_CREDENTIAL=epc-… EYES_DEVICE_DOOR_URL=https://<device-door> \
-#     curl -fsSL https://<your-host>/install.sh | bash -s -- <doppler-token> <factory-id> [version]
+#   curl -fsSL https://<your-host>/install.sh | bash -s -- <doppler-token> <factory-id> epc-…
 #
-# (Put a leading space before the assignment, or `export` it, so the credential stays out
-# of shell history. It is single-use and consumed server-side, so exposure after enroll is
-# moot.) Reinstalls/upgrades need NO credential — enrollment is idempotent (see step 4).
+# The device door defaults to the live Cloud Run door; override it with
+# EYES_DEVICE_DOOR_URL=https://<device-door> only if it moves. The credential may also be
+# passed via the EYES_ENROLL_CREDENTIAL env var instead of the arg (prefix a leading space
+# or `export` it to keep it out of shell history). Either way it is single-use and consumed
+# server-side, so exposure after enroll is moot. Reinstalls/upgrades need NO credential —
+# enrollment is idempotent (see step 4).
 #
 # Args:
 #   <doppler-token>  A Doppler token that can read the eyes project's shared
@@ -25,6 +28,10 @@
 #                    config as factory.uuid (+ celery worker location). There are
 #                    no per-factory config files — a new factory just installs
 #                    with its id. Secrets come from the shared prd_fleet config.
+#   [enroll-credential]  Optional one-time device-enroll credential (epc-…), minted with
+#                    scripts/eyes_device_admin.py. Redeemed once at the device door to
+#                    enroll this node's identity (A1); unused once enrolled. Falls back to
+#                    the EYES_ENROLL_CREDENTIAL env var. Omit to defer enrollment.
 #   [version]        Optional image tag to pin, e.g. v0.0.3. Defaults to
 #                    `latest`, which CI keeps pointed at the newest v* build.
 #
@@ -51,22 +58,28 @@
 #
 # Tunables (env): EYES_HOME (default: current dir), EYES_IMAGE_TAG (default latest),
 #   EYES_DOPPLER_PROJECT (default eyes), EYES_DOPPLER_CONFIG (default prd_<factory>),
-#   EYES_ENROLL_CREDENTIAL (one-time device-enroll credential; required only for first
-#   enrollment, unused once enrolled), EYES_DEVICE_DOOR_URL (public device-door base URL;
+#   EYES_ENROLL_CREDENTIAL (one-time device-enroll credential; may also be passed as the
+#   third positional arg; required only for first enrollment, unused once enrolled),
+#   EYES_DEVICE_DOOR_URL (public device-door base URL; defaults to the live Cloud Run door;
 #   may instead be carried in the Doppler config — it is not a secret).
 #
 set -euo pipefail
 
 TOKEN="${1:-}"; FACTORY_ID="${2:-}"
 if [[ -z "$TOKEN" || -z "$FACTORY_ID" ]]; then
-  echo "usage: install.sh <doppler-token> <factory-id> [version]" >&2
+  echo "usage: install.sh <doppler-token> <factory-id> [enroll-credential] [version]" >&2
   exit 1
 fi
+# One-time device-enroll credential ($3) — the same positional shape as the doppler
+# token and factory id. Optional: falls back to the EYES_ENROLL_CREDENTIAL env var (use
+# a leading space or `export` so it stays out of shell history when set that way), and
+# is unused once the node is enrolled (see step 3c).
+EYES_ENROLL_CREDENTIAL="${3:-${EYES_ENROLL_CREDENTIAL:-}}"
 # Deployment profile (config/profile/<name>.yaml). Real nodes are on-site; a dev
 # laptop/webcam rig passes EYES_PROFILE=dev.
 PROFILE="${EYES_PROFILE:-onsite}"
 
-VERSION="${3:-${EYES_IMAGE_TAG:-latest}}"
+VERSION="${4:-${EYES_IMAGE_TAG:-latest}}"
 # CI publishes linux/amd64. Real nodes are amd64; an Apple-Silicon dev box runs
 # it under emulation. Matches the compose platform pin.
 PLATFORM="${EYES_PLATFORM:-linux/amd64}"
@@ -193,7 +206,9 @@ fi
 #         boot-fetch parks (backs off) until a later install.sh enrolls it (order is
 #         forgiving by design — spec M3).
 IDENTITY_DIR="$EYES_HOME/identity"
-DOOR_URL="${EYES_DEVICE_DOOR_URL:-}"   # non-secret; may also arrive via the Doppler config sourced above
+# Public device-door base URL. Defaults to the live Cloud Run door; override with the
+# EYES_DEVICE_DOOR_URL env var or carry it in the Doppler config (sourced above). Non-secret.
+DOOR_URL="${EYES_DEVICE_DOOR_URL:-https://eyes-device-door-rj72it466a-nn.a.run.app}"
 mkdir -p "$IDENTITY_DIR"
 if [[ -f "$IDENTITY_DIR/device_key.pem" && -f "$IDENTITY_DIR/device.json" ]]; then
   echo "==> Device identity already present ($IDENTITY_DIR) — skipping enrollment."
@@ -218,7 +233,8 @@ else
   echo "         The stack will start, but the metadata boot-fetch will PARK until this" >&2
   echo "         node is enrolled. To enroll, mint a credential —" >&2
   echo "         scripts/eyes_device_admin.py mint --device-type factory_node --factory-id $FACTORY_ID —" >&2
-  echo "         then re-run install.sh with EYES_ENROLL_CREDENTIAL=epc-… (and EYES_DEVICE_DOOR_URL)." >&2
+  echo "         then re-run install.sh with the credential as the third arg:" >&2
+  echo "         install.sh <doppler-token> $FACTORY_ID epc-…  (the device door defaults; no URL needed)." >&2
 fi
 
 # 4. Launch (compose pulls redis as needed; eyes-app is already local).
