@@ -210,7 +210,17 @@ IDENTITY_DIR="$EYES_HOME/identity"
 # EYES_DEVICE_DOOR_URL env var or carry it in the Doppler config (sourced above). Non-secret.
 DOOR_URL="${EYES_DEVICE_DOOR_URL:-https://eyes-device-door-rj72it466a-nn.a.run.app}"
 mkdir -p "$IDENTITY_DIR"
-if [[ -f "$IDENTITY_DIR/device_key.pem" && -f "$IDENTITY_DIR/device.json" ]]; then
+# Is a COMPLETE identity already on disk? Check it with the SAME visibility enrollment
+# has — root, inside the image, over the same mount. The identity dir is root-owned and
+# 0700 (keys.py) and install commonly runs as a non-root user (docker via sudo), so a
+# host-side `[ -f … ]` here can't even stat the files for lack of search permission on
+# the dir: it would report the identity "absent" though it is present and send every
+# reinstall back through enrollment, straight into the enroll step's "already enrolled"
+# refusal (enroll.py, keys.key_exists). Running the check as container-root over the
+# bind mount is exactly what enroll sees, so a spun-down-then-reinstalled node whose
+# identity dir was kept is correctly recognized and skipped.
+if $DOCKER run --rm --platform "$PLATFORM" -v "$IDENTITY_DIR:/app/identity" "$IMAGE" \
+     sh -c 'test -f /app/identity/device_key.pem && test -f /app/identity/device.json'; then
   echo "==> Device identity already present ($IDENTITY_DIR) — skipping enrollment."
 elif [[ -n "${EYES_ENROLL_CREDENTIAL:-}" ]]; then
   [[ -n "$DOOR_URL" ]] || { echo "ERROR: EYES_ENROLL_CREDENTIAL is set but no device-door URL. Set EYES_DEVICE_DOOR_URL (env or Doppler config)." >&2; exit 1; }
