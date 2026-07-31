@@ -209,16 +209,34 @@ prior_env_value() {
 }
 CARRIED_MACHINE_ID="$(prior_env_value EYES_MACHINE_ID)"
 CARRIED_UPDATER_TAG="$(prior_env_value EYES_UPDATER_TAG)"
-# The active release's image coordinates. Step 1 runs THAT image to mint a device bearer
-# when an already-enrolled node is reinstalled without a credential — which is exactly the
-# repair path, so the same deletion breaks it in the same way.
-PRIOR_ENV_READABLE=""
-PRIOR_REPO=""
-PRIOR_TAG=""
-if [[ -r "$CURRENT_LINK/env" ]]; then
-  PRIOR_ENV_READABLE=1
-  PRIOR_REPO="$(sed -n 's/^EYES_IMAGE_REPO=//p' "$CURRENT_LINK/env" | tail -n1)"
-  PRIOR_TAG="$(sed -n 's/^EYES_IMAGE_TAG=//p' "$CURRENT_LINK/env" | tail -n1)"
+# An image already on this box that can mint a device bearer. Step 1 runs it when an
+# already-enrolled node is reinstalled without a credential — the repair path, and also
+# **every node's first A4 install**, which is the case this used to get wrong.
+#
+# A4-28: resolved through `prior_env_value`, i.e. `current/env` FIRST and then the pre-A4
+# legacy `docker/.env` — the same chain the machine id and the updater tag already use, two
+# lines above. Reading `current/env` alone made the gate below "is there an A4 release on
+# this box", when the question it has to answer is "is there an image on this box we can run
+# Python in". On a pre-A4 node those differ: there is no `current` symlink at all, so the
+# script refused an enrolled node whose identity was sitting right there in identity/ and
+# whose image was sitting right there in `docker images` — the exact migration A4 exists to
+# perform, on every node in the fleet.
+#
+# EYES_IMAGE_REPO is absent from a pre-A4 `docker/.env` (the compose spec's own default
+# supplied it), so fall back to that same default rather than treating "no repo named" as
+# "no image". The default is GHCR deliberately: a pre-A4 node's image came from GHCR, which
+# is also why the GHCR PAT stays alive until the fleet has soaked (Stage 7a).
+PRIOR_REPO="$(prior_env_value EYES_IMAGE_REPO)"
+PRIOR_TAG="$(prior_env_value EYES_IMAGE_TAG)"
+PRIOR_REPO="${PRIOR_REPO:-ghcr.io/riseautomation}"
+# The gate for the bearer-minting path: a tag to run, whose image is actually PRESENT. The
+# presence check is the point — the local image is what makes this work with no registry
+# credential of any kind, so "named but not on the box" has to fail here, with that said,
+# rather than as an opaque `docker run` pull attempt against a registry we cannot authenticate.
+PRIOR_IMAGE=""
+if [[ -n "$PRIOR_TAG" ]] \
+   && $DOCKER image inspect "$PRIOR_REPO/eyes-app:$PRIOR_TAG" >/dev/null 2>&1; then
+  PRIOR_IMAGE="$PRIOR_REPO/eyes-app:$PRIOR_TAG"
 fi
 
 mkdir -p "$RELEASES" "$IDENTITY_DIR" "$EYES_HOME/var/ota"
@@ -358,29 +376,70 @@ if [[ -n "${EYES_ENROLL_CREDENTIAL:-}" ]]; then
     echo "       Check the credential is un-consumed and unexpired (scripts/eyes_device_admin.py)." >&2
     exit 1
   }
-elif [[ -n "$PRIOR_ENV_READABLE" ]]; then
-  # Both read in step 0a, before the staging `rm -rf` could delete the file they come from
-  # on a same-version reinstall (§1.2). Same values, same order, read earlier.
-  if [[ -z "$PRIOR_REPO" || -z "$PRIOR_TAG" ]]; then
-    echo "ERROR: no enroll credential, and the active release's env names no image to" >&2
-    echo "       mint a device bearer with. Pass a credential as the SECOND arg." >&2
-    exit 1
-  fi
-  echo "==> Requesting an Artifact Registry pull token (device identity, via $PRIOR_REPO/eyes-app:$PRIOR_TAG) …"
-  PULL_JSON="$($DOCKER run --rm --platform "$PLATFORM" \
-    -v "$IDENTITY_DIR:/app/identity:ro" \
-    -e EYES_IDENTITY_DIR=/app/identity \
-    "$PRIOR_REPO/eyes-app:$PRIOR_TAG" \
-    python -m eyes.ota.door pull-token)" || {
-    echo "ERROR: could not mint a pull token from this node's device identity." >&2
-    echo "       Is the node revoked? Otherwise reissue a credential and pass it as arg 3:" >&2
-    echo "       scripts/eyes_device_admin.py reissue <device-id>" >&2
-    exit 1
+elif [[ -n "$PRIOR_IMAGE" ]]; then
+  # Resolved in step 0a, before the staging `rm -rf` could delete the file they come from on
+  # a same-version reinstall (§1.2). A4-28: `$PRIOR_IMAGE` is any eyes-app image already on
+  # the box — from `current/env` on an A4 node, from the legacy `docker/.env` on a pre-A4 one
+  # — so this branch covers the first A4 install of an enrolled node, not just an A4-to-A4
+  # reinstall.
+  #
+  # Gated on the IMAGE alone, and deliberately not also on a host-side `-r identity/device.json`:
+  # identity/ is root-owned 0700 (keys.py) while install commonly runs as a non-root user with
+  # docker-via-sudo, so a host-side stat cannot even search the directory and would report a
+  # present identity as absent. That is the exact trap the enrollment check below is written
+  # around, and it must not be reintroduced here. Whether an identity exists is settled by
+  # MINTING with it, in-image, over the same mount — so the failure path says so instead.
+  echo "==> Requesting an Artifact Registry pull token (device identity, via $PRIOR_IMAGE) …"
+  # `eyes.ota.door` is the intended path and the one the suite covers — but it only exists in
+  # an A4 image, and on every node's FIRST A4 install `$PRIOR_IMAGE` is by definition the
+  # PRE-A4 image, which has no `eyes.ota` package at all (A4-28). So try the module, then fall
+  # back to the same two calls spelled out against `eyes.device_identity`, which has been in
+  # the image since A1: mint a bearer off the Ed25519 key, POST it to /pull-token. The door
+  # base comes from the identity's own persisted `token_url` — the same source
+  # `door.identity_door_base()` reads — so the fallback cannot reach a different door than
+  # the module would have.
+  PORTABLE_MINT='
+import json, sys, httpx
+from eyes.device_identity.tokens import get_token
+try:
+    from eyes.device_identity.keys import load_identity
+    base = load_identity().token_url.rsplit("/", 1)[0]
+except Exception:
+    base = sys.argv[1].rstrip("/") + "/device/v1"
+r = httpx.post(base + "/pull-token", json={},
+               headers={"Authorization": "Bearer " + get_token()}, timeout=30.0)
+r.raise_for_status()
+json.dump(r.json(), sys.stdout)
+'
+  mint_in_image() {
+    $DOCKER run --rm --platform "$PLATFORM" \
+      -v "$IDENTITY_DIR:/app/identity:ro" \
+      -e EYES_IDENTITY_DIR=/app/identity \
+      "$PRIOR_IMAGE" "$@"
   }
+  PULL_JSON="$(mint_in_image python -m eyes.ota.door pull-token 2>/dev/null)" || PULL_JSON=""
+  if [[ -z "$PULL_JSON" ]]; then
+    echo "    (that image predates eyes.ota — minting via eyes.device_identity instead)"
+    PULL_JSON="$(mint_in_image python -c "$PORTABLE_MINT" "$DOOR_URL")" || {
+      echo "ERROR: could not mint a pull token from this node's device identity, using" >&2
+      echo "       $PRIOR_IMAGE. Three things do this, in order of likelihood:" >&2
+      echo "         * the node is NOT enrolled — no $IDENTITY_DIR/device_key.pem, so there" >&2
+      echo "           is nothing to mint with. This is a first bring-up: pass a credential." >&2
+      echo "         * the node's device identity is revoked or its factory is out of service." >&2
+      echo "         * the device door is unreachable from this box ($DOOR_URL)." >&2
+      echo "       Mint or reissue a credential and pass it as the SECOND arg:" >&2
+      echo "         scripts/eyes_device_admin.py reissue <device-id>" >&2
+      exit 1
+    }
+  fi
 else
-  echo "ERROR: this node has no active release and no EYES_ENROLL_CREDENTIAL, so it can" >&2
-  echo "       neither mint a device bearer nor present a credential for the image pull." >&2
-  echo "       Mint one and pass it as the SECOND arg:" >&2
+  # No credential AND no local eyes-app image: there is nothing on this box that can run the
+  # minting code, so a credential is genuinely required. This is a first bring-up.
+  echo "ERROR: no EYES_ENROLL_CREDENTIAL, and no eyes-app image is on this box to mint a" >&2
+  echo "       device bearer with, so the image pull cannot be authenticated." >&2
+  echo "       Looked for '$PRIOR_REPO/eyes-app:${PRIOR_TAG:-<no EYES_IMAGE_TAG in current/env or docker/.env>}'" >&2
+  echo "       (from current/env, then the pre-A4 docker/.env)." >&2
+  echo "       Mint a credential and pass it as the SECOND arg:" >&2
   echo "         scripts/eyes_device_admin.py mint --device-type factory_node --factory-id $FACTORY_ID" >&2
   exit 1
 fi
