@@ -91,6 +91,15 @@
 #   4. Fetch this node's resolved env from GET /device/v1/config and write
 #      releases/<tag>/env. This is the ONLY place secrets come from.
 #   5. Promote the release (current/previous symlinks) and `docker compose up -d`.
+#   6. Lay down the two HOST-level units (C10): a NIGHTLY REBOOT OF THE MACHINE at 03:00
+#      local — a rescue hook for the Tailscale work, which takes the VMS down with it and is
+#      meant to — and the bring-up that follows it. Both skip while an OTA bump is in flight.
+#      Never fatal — a node that cannot reinstall because a timer exists is a bricked node.
+#   7. Install the INDEPENDENT TAILNET PATH (C12): our own Tailscale beside the vendor's, so
+#      reaching this box stops depending on a tailnet we do not control. The tree is lifted
+#      out of the app image (/app/remote-access/) and installed to /opt/eyes-remote-access
+#      with its own unit — SEPARATE LIFECYCLE, shared install moment only. Never fatal.
+#      (Steps 6 and 7 here are steps 7 and 8 in the body, which numbers the launch separately.)
 #
 # Tunables (env): EYES_HOME (default: current dir), EYES_IMAGE_TAG (default latest),
 #   EYES_ENROLL_CREDENTIAL (one-time device-enroll credential; may also be passed as the
@@ -98,7 +107,11 @@
 #   EYES_DEVICE_DOOR_URL (public device-door base URL; defaults to the live Cloud Run
 #   door — it is not a secret),
 #   EYES_REC_HOST / EYES_REC_CONTAINER (recordings dir overrides for a dev rig; normally
-#   delivered per-device by /config instead).
+#   delivered per-device by /config instead),
+#   EYES_SYSTEMD_DIR / EYES_LIBEXEC_DIR / EYES_HOST_CONF_DIR (where step 7 writes the host
+#   units, the script they run and their EnvironmentFile; default /etc/systemd/system,
+#   /usr/local/lib/eyes and /etc/eyes. Redirect them at a writable tree to install the units
+#   without root — which is also how the suite exercises this step).
 #
 set -euo pipefail
 
@@ -728,6 +741,662 @@ if [[ -f "$OTA_STATE" ]]; then
   echo "==> Moved the previous updater journal aside → $(basename "$ARCHIVED")"
   echo "    (a terminal \`failed\` state would otherwise survive this install and keep the"
   echo "     node frozen out of OTA; the updater rebuilds a fresh one from the symlinks)."
+fi
+
+# ── 7. Host-level units: the nightly reboot and the bring-up after it (C10) ──
+# Two jobs that must outlive any single release, so they live on the HOST rather than in a
+# release dir — a revert must not be able to silently uninstall a scheduled job, and a stack
+# that did not come back after a reboot must not depend on the release that failed to.
+#
+#   eyes-nightly-reboot.timer    03:00 node-local, jittered, fires
+#   eyes-nightly-reboot.service  which reboots THE MACHINE.
+#   eyes-stack.service           `compose up -d` through current/ on the way back up.
+#
+# **THIS ONE REBOOTS THE HOST, AND THAT IS THE POINT.** It is not a stack restart and must not
+# be softened into one. It exists as a RESCUE HOOK: C11/C12 add our own Tailscale beside the
+# vendor's on a box whose only remote access is that vendor's tailnet, so the failure mode
+# being designed against is "we lose the route in and nobody can walk to the machine". A
+# reboot is the only thing that recovers a box from that class of mistake, because it discards
+# every piece of running state that was never persisted — a daemon in a namespace, iptables
+# chains, a rewritten resolv.conf.
+#
+# Two consequences worth being explicit about, because both are easy to forget later:
+#
+#   * **It takes the VMS vendor's appliance down with it, nightly.** This machine is theirs
+#     with our stack added to it. That was a deliberate, explicitly-taken decision, not an
+#     oversight — anyone who finds this and thinks it looks reckless is reading it correctly
+#     and should go and ask rather than quietly weaken it.
+#   * **A reboot only rescues what was never persisted.** A bad committed config comes back
+#     exactly as broken. This buys back a box wedged by a live experiment, not one wedged by
+#     something written to disk.
+#
+# THE INTERLOCK. eyes/ota/gate.py runs a three-phase health gate after a swap, budgeted at up
+# to ~28 minutes (T_boot 180 s + T_live 300 s + T_pipe 1200 s). A reboot landing in that window
+# fails it exactly as a restart would — the updater itself survives (its journal is crash-safe
+# precisely because a host reboot mid-bump was always possible) but the GATE does not, and the
+# result is a healthy release reverted at 03:00 with nobody watching. So the job reads
+# var/ota/state.json and skips the night when a bump is in flight. It only ever READS it: the
+# updater is that file's single writer (eyes/ota/journal.py) and that invariant is what makes
+# its crash-recovery reasoning sound.
+#
+# …but the interlock must not be able to disable the rescue, which is the whole reason the
+# thing exists. So an in-flight state that is OLDER than any bump could legitimately be is
+# treated as a wedged updater rather than as a live bump, and the reboot proceeds (loudly). A
+# reboot is good medicine for a wedged updater anyway.
+#
+# The units name $EYES_HOME/current/…, which is stable across every bump and revert, so
+# nothing installed here changes with a release. The one per-node fact — $EYES_HOME itself,
+# /home/valtorvms/Rise/Eyes in production and not /opt/eyes — goes in an EnvironmentFile, so
+# the units and the script are byte-identical on every node.
+#
+# THIS STEP MAY NEVER FAIL THE INSTALL. install.sh is also the recovery path for a node that
+# can run neither release, and a node that cannot reinstall because a timer already exists (or
+# because this box has no systemd, or because sudo is unavailable) is a node we have bricked.
+# Every failure below is a WARNING naming what to do by hand, and the install continues.
+# It is also idempotent: the unit files are rewritten wholesale and `systemctl enable` is a
+# symlink at a fixed path, so a reinstall leaves exactly one timer.
+#
+# Root is REQUIRED here and there is no way around it: nothing inside a container can reboot
+# the host it runs on. install.sh already probes for docker-via-sudo (step 1); this needs the
+# same escalation for systemctl, which is not necessarily the same sudoers grant.
+#
+# Run LAST, after the stack is up, for the same reason §6b's move-aside is: a failed launch
+# should leave the box in a state the operator can reason about, not one this step has since
+# scheduled a reboot against.
+UNIT_DIR="${EYES_SYSTEMD_DIR:-/etc/systemd/system}"
+LIBEXEC_DIR="${EYES_LIBEXEC_DIR:-/usr/local/lib/eyes}"
+HOST_CONF_DIR="${EYES_HOST_CONF_DIR:-/etc/eyes}"
+
+install_host_units() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "WARNING: no systemctl on this host, so the nightly reboot and the after-reboot" >&2
+    echo "         bring-up were NOT installed. The stack itself is up and unaffected." >&2
+    echo "         Everything else on this box is unchanged." >&2
+    return 1
+  fi
+
+  # These land outside $EYES_HOME, so they need root — and install.sh commonly runs as a
+  # non-root user with docker-via-sudo (step 1 assumes exactly that). Probe the same way
+  # $DOCKER is probed: try direct, fall back to sudo. Probing with a real write rather than
+  # `mkdir -p`, which succeeds on an existing directory whether or not it is writable.
+  AS_ROOT=""
+  probe="$UNIT_DIR/.eyes-write-probe.$$"
+  if mkdir -p "$UNIT_DIR" 2>/dev/null && : > "$probe" 2>/dev/null; then
+    rm -f "$probe"
+  elif command -v sudo >/dev/null 2>&1 && sudo mkdir -p "$UNIT_DIR" 2>/dev/null; then
+    AS_ROOT="sudo"
+  else
+    echo "WARNING: cannot write $UNIT_DIR (not root, and sudo is unavailable), so the" >&2
+    echo "         nightly reboot and the after-reboot bring-up were NOT installed." >&2
+    echo "         Re-run this install as root to add them. The stack is up regardless." >&2
+    echo "         NB a sudoers policy that grants only 'docker' is enough for every other" >&2
+    echo "         step of this install and not enough for this one." >&2
+    return 1
+  fi
+  $AS_ROOT mkdir -p "$LIBEXEC_DIR" "$HOST_CONF_DIR" || return 1
+
+  # <path> <mode>, content on stdin. Staged and then `install`ed into place, so systemd can
+  # never execute a half-written file, and so the destination is owned by whoever `$AS_ROOT`
+  # makes us (root on a node) rather than by the user who happened to run the install.
+  install_file() {
+    staged="$(mktemp)" || return 1
+    cat > "$staged"
+    $AS_ROOT install -m "$2" "$staged" "$1" || { rm -f "$staged"; return 1; }
+    rm -f "$staged"
+  }
+
+  install_file "$HOST_CONF_DIR/node.env" 0644 <<EYES_NODE_ENV || return 1
+# Written by scripts/install.sh. The one per-node fact the Eyes host units need: everything
+# else they touch hangs off it. \$EYES_HOME differs per node — /home/valtorvms/Rise/Eyes in
+# production, not /opt/eyes — which is why it is here and not baked into the units.
+EYES_HOME=$EYES_HOME
+EYES_NODE_ENV
+
+  install_file "$LIBEXEC_DIR/eyes-host.sh" 0755 <<'EYES_HOST_SH' || return 1
+#!/bin/sh
+#
+# Eyes host jobs — the two that outlive any single release (C10/RIS-99).
+#
+#   eyes-host.sh nightly-reboot   REBOOT THE MACHINE at 03:00 node-local.
+#   eyes-host.sh boot             bring the compose stack back up afterwards: `up -d`
+#                                 through current/, which starts whatever the daemon's
+#                                 restart policies did not.
+#
+# THE REBOOT IS DELIBERATE AND IS THE POINT OF THIS FILE. It is a RESCUE HOOK. C11/C12 put our
+# own Tailscale on a box whose only remote access is the VMS vendor's tailnet, so the failure
+# being designed against is "we lose the route in and nobody can walk to the machine". A
+# reboot is the one thing that recovers a box from that, because it discards every piece of
+# running state that was never persisted — a daemon in a namespace, iptables chains, a
+# rewritten resolv.conf. It does NOT rescue a bad committed config, which comes back as broken
+# as it went down.
+#
+# It also takes the vendor's VMS down with it, nightly. That is a decision that was taken with
+# its eyes open, not an accident. If it looks reckless to you, you are reading it correctly —
+# go and ask, rather than quietly softening it into a stack restart.
+#
+# THE INTERLOCK. eyes/ota/gate.py runs a three-phase gate after a swap — T_boot 180 s +
+# T_live 300 s + T_pipe 1200 s, so up to ~28 minutes. A reboot inside that window fails it by
+# construction: containers go `restarting` (phase 1), the command-listener's poll beacon is
+# delayed (phase 2), and the frames-processed counter stops advancing (phase 3, where an
+# unreadable counter is a deliberate FAIL, not a skip). The updater itself survives — its
+# journal is crash-safe precisely because a host reboot mid-bump was always possible — but the
+# gate does not, and the consequence is a healthy release reverted at 03:00 with nobody
+# watching. So: read the updater's journal first, and SKIP THE NIGHT when a bump is in flight.
+#
+# Skip, never defer. A reboot moved to 03:25 is the same reboot with a worse alibi.
+#
+# BUT THE INTERLOCK MUST NOT BE ABLE TO DISABLE THE RESCUE. An in-flight state older than any
+# bump could legitimately be is a wedged updater, not a live bump, and the reboot proceeds —
+# loudly. A reboot is good medicine for a wedged updater in any case.
+#
+# var/ota/state.json is READ-ONLY here. The updater is its single writer (eyes/ota/journal.py)
+# and that invariant is what makes its crash-recovery reasoning sound; a reboot script is not a
+# good enough reason to add a second writer.
+#
+# Installed by scripts/install.sh into /usr/local/lib/eyes/, OUTSIDE every release dir, and
+# driven by eyes-nightly-reboot.timer / eyes-stack.service. It refers only to
+# $EYES_HOME/current/, which is stable across every bump and revert, so this file never
+# changes with a release. $EYES_HOME arrives from /etc/eyes/node.env.
+set -eu
+
+MODE="${1:-}"
+case "$MODE" in
+  boot|nightly-reboot) ;;
+  *) echo "usage: eyes-host.sh <boot|nightly-reboot>" >&2; exit 2 ;;
+esac
+
+: "${EYES_HOME:?EYES_HOME is unset — it comes from /etc/eyes/node.env, which install.sh writes}"
+
+COMPOSE_FILE="$EYES_HOME/current/docker-compose.yml"
+RELEASE_ENV="$EYES_HOME/current/env"
+OTA_STATE="$EYES_HOME/var/ota/state.json"
+
+# How long `boot` waits for the daemon. After=docker.service only means the unit started.
+DOCKER_WAIT_S="${EYES_DOCKER_WAIT_S:-180}"
+
+# A bump cannot legitimately be in flight for longer than this: the gate budgets total ~28 min
+# and the pull is bounded at 3600 s (dockercli.PULL_TIMEOUT_S), so ~1.5 h is the honest worst
+# case for a slow site uplink. Past four hours the journal is describing a bump that is not
+# happening, and refusing to reboot on that basis would let a wedged updater switch off the
+# rescue hook — the one failure this whole unit exists to survive.
+STALE_IN_FLIGHT_S="${EYES_STALE_IN_FLIGHT_S:-14400}"
+
+# Do not reboot a machine that has only just come up. Nothing here should be able to produce a
+# reboot LOOP: a box that reboots every few minutes is unreachable for good, and unreachable
+# for good is precisely the outcome this unit is the insurance against. `Persistent=false` on
+# the timer is the other half of that (no catch-up firing the instant a box boots).
+MIN_UPTIME_S="${EYES_MIN_UPTIME_S:-1800}"
+
+log()  { echo "eyes-host[$MODE]: $*"; }
+warn() { echo "eyes-host[$MODE]: $*" >&2; }
+
+# A4-35: compose gives the PROCESS ENVIRONMENT precedence over --env-file when it interpolates
+# the spec, and the release env is the sole authority for this pin. systemd hands us a clean
+# environment, but a hand-run from a shell that exported one must not be able to resolve a
+# different updater image than the file names.
+unset EYES_UPDATER_TAG
+
+# Always through current/, always with an explicit --env-file — the invariant install.sh and
+# the updater already hold (install.sh §6). The project name is pinned to `eyes` in the spec,
+# so this reconciles the SAME stack rather than standing up a second one. And EYES_UPDATER_TAG
+# has no default, so an invocation that forgot the env file is a compose PARSE ERROR: loud,
+# immediate, and on the right box.
+compose() { docker compose -f "$COMPOSE_FILE" --env-file "$RELEASE_ENV" "$@"; }
+
+release_env_value() {
+  # One key out of the release env. sed, deliberately not a parser — there is no python on the
+  # host (docs/node-lifecycle.md) and this file is KEY=VALUE lines. Same idiom install.sh's
+  # own `prior_env_value` uses.
+  [ -r "$RELEASE_ENV" ] || return 1
+  sed -n "s/^$1=//p" "$RELEASE_ENV" | tail -n1
+}
+
+require_release() {
+  # `boot` only. The nightly reboot deliberately does NOT require a working release: a box
+  # whose Eyes install is broken is exactly the box that most needs its rescue hook to fire.
+  if [ ! -r "$COMPOSE_FILE" ]; then
+    warn "no compose spec at $COMPOSE_FILE. Is EYES_HOME ($EYES_HOME) right, and has"
+    warn "install.sh ever run here? Doing nothing."
+    exit 1
+  fi
+  if [ ! -r "$RELEASE_ENV" ]; then
+    warn "no release env at $RELEASE_ENV. Doing nothing — EYES_UPDATER_TAG has no default,"
+    warn "so a compose invocation without that file cannot even parse the spec."
+    exit 1
+  fi
+}
+
+# ── The interlock ───────────────────────────────────────────────────────────────────────
+# Five verdicts: absent | clear | stale-in-flight | in-flight | unreadable. The first three
+# proceed; the last two do not.
+#
+# `absent` and `unreadable` are deliberately NOT the same answer. A node with no journal has
+# never bumped and is therefore plainly not mid-bump; a journal that exists and cannot be read
+# is not evidence of anything, least of all of safety.
+#
+# That is the OPPOSITE default from Journal.read(), which degrades an unparsable file to
+# `idle`. Both are right: the updater refusing to start over a corrupt journal would turn one
+# bad write into a node that needs SSH, whereas our failure mode is not "stand down" but
+# "reboot the machine in the middle of a health gate".
+
+# Mirrors journal.State.in_flight exactly, so the two cannot drift, plus the staleness escape.
+# A self-update `handoff` is deliberately NOT in-flight: it is decided by the updater's own
+# beacon, which a reboot re-establishes rather than breaks, and a stale stamp would otherwise
+# suppress the reboot silently.
+#
+# Age is measured from `started_at` (when the bump began) rather than `updated_at`, which the
+# updater refreshes every tick with its container snapshot — so `updated_at` stays young on a
+# node that has been stuck in `bumping` for hours, i.e. on exactly the node this is for. An
+# age that cannot be determined at all counts as FRESH: the file says a bump is in flight and
+# nothing contradicts it, and a false revert is worse than a rescue delayed by a day.
+PARSE_STATE_PY='
+import json, sys, time
+STALE = float(sys.argv[1])
+try:
+    with open("/s/state.json") as fh:
+        data = json.load(fh)
+except Exception:
+    print("unreadable"); sys.exit(0)
+if not isinstance(data, dict) or "state" not in data:
+    print("unreadable"); sys.exit(0)
+if data["state"] not in ("bumping", "reverting"):
+    print("clear"); sys.exit(0)
+try:
+    started = float(data.get("started_at") or data.get("updated_at") or 0)
+except (TypeError, ValueError):
+    started = 0.0
+age = time.time() - started
+print("stale-in-flight" if started > 0 and age > STALE else "in-flight")
+'
+
+verdict_via_updater_image() {
+  # The preferred read: a real JSON parse, run inside the image that is already on this box
+  # and already pinned, whose stdlib is the same one that WROTE the file. Zero new host
+  # dependencies (there is no python on the host).
+  repo="$(release_env_value EYES_IMAGE_REPO)" || return 1
+  tag="$(release_env_value EYES_UPDATER_TAG)" || return 1
+  [ -n "$repo" ] && [ -n "$tag" ] || return 1
+  image="$repo/eyes-updater:$tag"
+  # Local images ONLY. This box authenticates pulls with a ~1 h token it does not hold, so a
+  # pull attempt would stall or fail rather than help.
+  docker image inspect "$image" >/dev/null 2>&1 || return 1
+  out="$(docker run --rm --network none -v "$EYES_HOME/var/ota:/s:ro" \
+         "$image" python -c "$PARSE_STATE_PY" "$STALE_IN_FLIGHT_S" 2>/dev/null)" || return 1
+  case "$out" in
+    in-flight|stale-in-flight|clear|unreadable) printf '%s' "$out" ;;
+    *) return 1 ;;
+  esac
+}
+
+verdict_via_grep() {
+  # The fallback, for when the daemon or the image cannot answer — which includes the boot
+  # path, where the daemon may be the thing that is unwell.
+  #
+  # journal._atomic_write_json writes json.dumps(indent=2, sort_keys=True), so the journal's
+  # own `state` is the only key at indent 2 spelled that way. THE INDENT ANCHOR IS
+  # LOAD-BEARING: `gate_detail` carries a per-container `"state"` nested deeper, and
+  # `gate_detail` sorts BEFORE `state` at the top level, so an unanchored grep reads a
+  # container's state and answers confidently wrong.
+  #
+  # Coupled to that formatting on purpose, and fenced by a test that writes the file with the
+  # real Journal and reads it back with this function. If the shape ever changes, nothing
+  # matches and the answer is `unreadable` — a loud skip, never a silent reboot.
+  line="$(grep -E '^  "state": ' "$OTA_STATE" 2>/dev/null | head -n1)" || line=""
+  case "$line" in
+    *'"idle"'*|*'"failed"'*)       echo clear;      return 0 ;;
+    *'"bumping"'*|*'"reverting"'*) ;;
+    *)                             echo unreadable; return 0 ;;
+  esac
+  # In flight — but for how long? Integer seconds only; the fractional part is noise at this
+  # scale and POSIX sh cannot do float arithmetic anyway.
+  started="$(grep -E '^  "started_at": ' "$OTA_STATE" 2>/dev/null | head -n1 \
+             | sed -n 's/.*: *\([0-9]*\).*/\1/p')" || started=""
+  if [ -n "$started" ] && [ "$started" -gt 0 ] 2>/dev/null \
+     && [ "$(( $(date +%s) - started ))" -gt "$STALE_IN_FLIGHT_S" ] 2>/dev/null; then
+    echo stale-in-flight
+  else
+    echo in-flight
+  fi
+}
+
+ota_verdict() {
+  [ -f "$OTA_STATE" ] || { echo absent; return 0; }
+  verdict="$(verdict_via_updater_image)" && { printf '%s\n' "$verdict"; return 0; }
+  verdict_via_grep
+}
+
+interlock_or_exit() {
+  case "$(ota_verdict)" in
+    absent)
+      log "no updater journal at $OTA_STATE — a node that has never bumped is not mid-bump. Proceeding." ;;
+    clear)
+      log "the updater journal reports no bump in flight. Proceeding." ;;
+    stale-in-flight)
+      warn "the updater journal says a bump is in flight, but it started more than"
+      warn "${STALE_IN_FLIGHT_S}s ago — longer than any bump can legitimately take. Treating"
+      warn "the updater as WEDGED rather than busy, and proceeding: a stuck journal must not"
+      warn "be able to switch off this node's rescue hook, and a reboot is good medicine for a"
+      warn "wedged updater. Look at $OTA_STATE." ;;
+    in-flight)
+      log "SKIPPING: an OTA bump or revert is IN FLIGHT ($OTA_STATE)."
+      log "Acting now would fail the post-swap health gate and revert a release that is very"
+      log "probably healthy. Skipping this run entirely rather than deferring it."
+      exit 0 ;;
+    unreadable)
+      warn "SKIPPING: $OTA_STATE exists but could not be read, so whether a bump is in flight"
+      warn "is unknown — and an unparsable journal is not evidence of safety. Skipping, and"
+      warn "failing loudly so this shows up in \`systemctl --failed\` rather than as a node"
+      warn "that quietly never reboots. Look at the file; the updater owns it."
+      exit 1 ;;
+  esac
+}
+
+uptime_s() {
+  # /proc/uptime is "<seconds since boot> <idle>"; the integer part is plenty. Overridable so
+  # the suite can exercise the loop guard on a dev box that has no /proc — the guard is the one
+  # piece of this whose failure mode is an unreachable machine, so it does not go untested for
+  # want of a Linux laptop. Unreadable means "cannot tell", and the guard then stands aside:
+  # a rescue hook that refuses to fire because it could not stat a file is not a rescue hook.
+  uptime_file="${EYES_UPTIME_FILE:-/proc/uptime}"
+  [ -r "$uptime_file" ] || { echo ""; return 0; }
+  cut -d' ' -f1 "$uptime_file" | cut -d. -f1
+}
+
+wait_for_docker() {
+  waited=0
+  while ! docker info >/dev/null 2>&1; do
+    if [ "$waited" -ge "$DOCKER_WAIT_S" ]; then
+      warn "the docker daemon did not answer within ${DOCKER_WAIT_S}s. Doing nothing."
+      return 1
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  if [ "$waited" -gt 0 ]; then log "the docker daemon answered after ${waited}s."; fi
+}
+
+do_boot() {
+  # `up -d`, not `restart`: after a reboot some containers may not exist at all, and this is
+  # the same reconcile install.sh §6 performs. The container restart policies bring most of the
+  # stack back on their own; this closes what they cannot — `command-listener` is
+  # `restart: on-failure`, so a clean exit stays stopped, and a container that never existed
+  # has no policy at all. With a reboot happening EVERY night, that gap would be a nightly one.
+  #
+  # It is safe here and would not be in a scheduled job, precisely because of the interlock:
+  # recreating containers re-reads the spec and the env file, which is a release operation, and
+  # the one moment those disagree with what is running is mid-bump.
+  #
+  # No service list, so eyes-updater comes back too — at boot that is the point.
+  wait_for_docker || exit 1
+  require_release
+  interlock_or_exit
+  log "reconciling the stack from $COMPOSE_FILE"
+  compose up -d
+  log "the stack is up."
+}
+
+do_nightly_reboot() {
+  up="$(uptime_s)"
+  if [ -n "$up" ] && [ "$up" -lt "$MIN_UPTIME_S" ] 2>/dev/null; then
+    log "SKIPPING: this machine has only been up ${up}s (floor ${MIN_UPTIME_S}s)."
+    log "Rebooting a box that has only just come up buys nothing, and a reboot loop on a"
+    log "machine nobody can walk up to is unrecoverable. This is that guard."
+    exit 0
+  fi
+  interlock_or_exit
+  # Deliberately NOT stopping the stack first. systemd stops docker.service on the way down,
+  # which SIGTERMs every container; Celery's task_acks_late + task_reject_on_worker_lost
+  # (eyes/entrypoint.py) mean a task in flight when its worker dies is redelivered rather than
+  # lost, so a graceful drain would buy nothing but a longer window.
+  log "REBOOTING THIS MACHINE NOW (nightly, 03:00 local, C10/RIS-99)."
+  log "The stack comes back via the container restart policies plus eyes-stack.service."
+  systemctl reboot
+}
+
+case "$MODE" in
+  boot)           do_boot ;;
+  nightly-reboot) do_nightly_reboot ;;
+esac
+EYES_HOST_SH
+
+  install_file "$UNIT_DIR/eyes-stack.service" 0644 <<'EYES_STACK_SERVICE' || return 1
+[Unit]
+# Brings the Eyes compose stack back after the host reboots — which, since C10, is EVERY
+# night. That makes this unit load-bearing rather than an insurance policy: the container
+# restart policies restore most of the stack when the daemon starts, but `command-listener` is
+# `restart: on-failure` so a clean exit stays stopped, and a container that never existed has
+# no policy at all. `up -d` is idempotent, so on the boot where the policies did their job this
+# does nothing.
+Description=Eyes stack (bring the compose stack up after a host reboot)
+# `Wants`, deliberately NOT `Requires`. This box is the VMS vendor's appliance and how their
+# docker is packaged is not ours to assume: under snap the unit is `snap.docker.dockerd`, not
+# `docker.service`, and `Requires=` a unit that does not exist makes THIS unit fail outright —
+# so a naming difference we do not control would turn the after-reboot bring-up into a unit
+# that silently never runs. `Wants` orders us behind it when it exists and is harmless when it
+# does not; the real dependency is the daemon answering, which eyes-host.sh waits for and
+# reports on. (Observed: `Failed to start eyes-stack.service: Unit docker.service not found`.)
+Wants=docker.service network-online.target
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/eyes/node.env
+ExecStart=/usr/local/lib/eyes/eyes-host.sh boot
+# Generous: the script waits for the daemon, and `up -d` on a cold box has images to start.
+TimeoutStartSec=1200
+
+# There is deliberately NO ExecStop. Stopping this unit must not take the stack down — that
+# would make `systemctl stop eyes-stack` a site outage button, and worse, systemd stops units
+# at shutdown, so the nightly reboot would tear the stack down through this unit on the way out
+# for no benefit. The daemon already signals containers when it stops.
+
+[Install]
+WantedBy=multi-user.target
+EYES_STACK_SERVICE
+
+  install_file "$UNIT_DIR/eyes-nightly-reboot.service" 0644 <<'EYES_NIGHTLY_REBOOT_SERVICE' || return 1
+[Unit]
+# Reboots THE MACHINE. Started by eyes-nightly-reboot.timer, and deliberately NOT enabled
+# itself — a reboot unit wired into a target would be a reboot loop.
+#
+# It is a rescue hook: C11/C12 put our own Tailscale beside the vendor's on a box whose only
+# remote access is that vendor's tailnet, and a reboot is the one thing that recovers a machine
+# from an experiment that took the route in with it. It skips the night if an OTA bump is in
+# flight — see eyes-host.sh.
+Description=Eyes nightly machine reboot (skips while an OTA bump is in flight)
+# Ordering only, and no `Requires=` — see the note in eyes-stack.service. The interlock reads
+# the updater's journal, which is a file; docker is only needed for the nicer of the two ways
+# of parsing it, and the script falls back when it is not there.
+After=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/eyes/node.env
+ExecStart=/usr/local/lib/eyes/eyes-host.sh nightly-reboot
+TimeoutStartSec=600
+EYES_NIGHTLY_REBOOT_SERVICE
+
+  install_file "$UNIT_DIR/eyes-nightly-reboot.timer" 0644 <<'EYES_NIGHTLY_REBOOT_TIMER' || return 1
+[Unit]
+Description=Reboot this machine nightly at 03:00 node-local time
+
+[Timer]
+# Node-local 03:00: systemd reads the host's /etc/localtime, and the containers mount the same
+# file, so "03:00" here and the timestamps in the stack's logs are the same clock.
+OnCalendar=*-*-* 03:00:00
+# LOAD-BEARING, and more so than it looks. `Persistent=true` would make a box that was off at
+# 03:00 reboot the instant it came up — which is a reboot loop on any machine whose boot lands
+# after 03:00, i.e. an unreachable node, i.e. the exact outcome this timer is insurance
+# against. The script's minimum-uptime floor is the second half of the same guard.
+Persistent=false
+# Two nodes today, more later. A fleet rebooting in lockstep is a thundering herd against the
+# device door and the ingest API at 03:00, and every node's stack re-enrolling at once.
+RandomizedDelaySec=300
+Unit=eyes-nightly-reboot.service
+
+[Install]
+WantedBy=timers.target
+EYES_NIGHTLY_REBOOT_TIMER
+
+  $AS_ROOT systemctl daemon-reload || return 1
+  # `enable` is a symlink at a fixed path and the unit files are rewritten wholesale, so a
+  # reinstall converges rather than accumulating.
+  $AS_ROOT systemctl enable eyes-nightly-reboot.timer || return 1
+  $AS_ROOT systemctl start eyes-nightly-reboot.timer || return 1
+  $AS_ROOT systemctl enable eyes-stack.service || return 1
+
+  # Starting the boot unit NOW is a proof, not part of the installation: it runs the same
+  # reconcile tonight's reboot will, so a unit that cannot run is found by the operator
+  # standing at the box rather than at 3 a.m. tomorrow. The stack is already up, so it is a
+  # no-op when it works. It is therefore reported and NOT fatal — the units are written and
+  # enabled either way, and saying "not installed" when they are is worse than saying nothing.
+  #
+  # Nothing here ever starts eyes-nightly-reboot.service. Proving THAT one by running it would
+  # reboot the box under the operator who is mid-install.
+  if ! $AS_ROOT systemctl start eyes-stack.service; then
+    echo "WARNING: eyes-stack.service is installed and enabled, but did NOT start just now." >&2
+    echo "         It is the unit that brings this stack back after the nightly reboot, so it" >&2
+    echo "         will fail the same way tonight. Diagnose it here, while you are on the box:" >&2
+    echo "           systemctl status eyes-stack.service; journalctl -u eyes-stack.service" >&2
+    echo "         A dependency named differently on this host (docker packaged as a snap" >&2
+    echo "         rather than docker.service) is the likeliest cause." >&2
+  fi
+  echo "==> Host units installed."
+  echo "    *** THIS MACHINE WILL REBOOT NIGHTLY AT 03:00 LOCAL (±5 min). ***"
+  echo "    That takes the VMS down with it. It is deliberate — C10/RIS-99, a rescue hook for"
+  echo "    the Tailscale work — and it is skipped while an OTA bump is in flight."
+  echo "      systemctl list-timers eyes-nightly-reboot.timer"
+  echo "      sudo systemctl mask eyes-nightly-reboot.timer   # stop it on this node"
+  return 0
+}
+
+if ! install_host_units; then
+  echo "WARNING: the Eyes host units (nightly reboot + after-reboot bring-up) were not" >&2
+  echo "         installed — see above. The stack is up and this install is otherwise" >&2
+  echo "         complete. NOTE this node will NOT reboot nightly, so it does not have the" >&2
+  echo "         rescue hook the Tailscale work assumes." >&2
+fi
+
+# ── 8. The independent tailnet path (C12/RIS-101) ────────────────────────────
+# Our OWN Tailscale beside the VMS vendor's, so that reaching this box stops depending on a
+# tailnet we do not control and a share the vendor can revoke with one click. Step 7 installs
+# the nightly reboot that exists as a rescue hook for exactly this work; this step installs the
+# thing it is a rescue hook FOR.
+#
+# WHY THIS IS A STEP OF *THIS* INSTALLER, given the design insists on a SEPARATE LIFECYCLE.
+# Because "separate lifecycle" is a claim about the RUNTIME, not about who lays the files down.
+# What must stay separate — and still does, untouched by this step — is: its own compose
+# project (`eyes-remote-access`, never `eyes`), its own unit with NO ordering relation to
+# eyes-stack.service in either direction, its own state volume, /opt/eyes-remote-access rather
+# than a release dir, and no OTA participation at all. `remote-access.sh doctor` § 3 asserts
+# the last of those on every run.
+#
+# Sharing the install MOMENT buys the thing that was actually missing: every node gets the
+# rescue path automatically, while everything still works, rather than when someone remembers.
+# Contempo had it and Classique did not, purely because it was a second manual operation.
+#
+# WHERE THE FILES COME FROM, and the trade taken (C12, 2026-08-24). They are lifted out of the
+# eyes-app image already pulled above, at /app/remote-access/ — the same `docker cp` mechanism
+# step 2 uses for the compose spec. The alternative was the public fleet-deployment mirror.
+#
+#   * cost: the rescue path's version IS the app release's version, so fixing it means cutting
+#     a release; and it cannot be installed FRESH on a node that cannot pull the image, which
+#     needs a pull-token and therefore a working control plane.
+#   * why that is acceptable: this step runs on EVERY install, so the rescue path is on the
+#     node long before anyone needs it. You never install it during an emergency. The residual
+#     exposure is a node that never ran a post-C12 install.sh AND has lost the control plane.
+#
+# THE STAGING DIR MUST BE OUTSIDE $EYES_HOME. Copying into releases/<tag>/ would trip the
+# release-dir guard inside remote-access/scripts/install.sh AND fail doctor § 3 — correctly,
+# because an OTA bump rewrites release dirs and would rewrite the rescue path with them.
+#
+# THIS STEP MAY NEVER FAIL THE INSTALL, for step 7's reason: install.sh is the documented
+# escape from a node that can run neither release, and a node that cannot reinstall because
+# the rescue path would not install is a node we have bricked. Every failure is a WARNING.
+#
+# IDEMPOTENT: the inner installer reuses an existing /etc/eyes-remote-access/env unless passed
+# --from-door, so a re-install neither re-mints a credential nor disturbs a live tunnel.
+#
+# UNTIL RIS-111 LANDS, a node with NO existing credential warns and continues: the inner
+# fetch-credential.sh still reads the fleet-wide EYES_TAILSCALE_AUTHKEY that RIS-109 dropped.
+# A node that already has /etc/eyes-remote-access/env converges silently — which is why this
+# is safe to run on Contempo today, and why it does nothing useful on Classique yet.
+RA_IMAGE_DIR="${EYES_RA_IMAGE_DIR:-remote-access}" # where the tree lives INSIDE the image
+
+install_remote_access() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "WARNING: no systemctl on this host, so the independent tailnet path (C12) was NOT" >&2
+    echo "         installed. The stack is up and unaffected." >&2
+    return 1
+  fi
+
+  # Same probe as step 7, for the same reason: this lands in /opt, /etc and /etc/systemd/system,
+  # none of which are under $EYES_HOME. A real write, not `mkdir -p`, which succeeds on an
+  # existing directory whether or not it is writable. /opt stands in for all three — the inner
+  # installer checks the rest itself and fails loudly. Overridable for the same reason step 7's
+  # EYES_SYSTEMD_DIR is: so this can be exercised by a test without root.
+  local as_root="" probe probe_dir="${EYES_RA_PROBE_DIR:-/opt}"
+  probe="$probe_dir/.eyes-write-probe.$$"
+  if mkdir -p "$probe_dir" 2>/dev/null && : >"$probe" 2>/dev/null; then
+    rm -f "$probe"
+  elif command -v sudo >/dev/null 2>&1 && sudo mkdir -p "$probe_dir" 2>/dev/null; then
+    as_root="sudo"
+  else
+    echo "WARNING: cannot write $probe_dir (not root, and sudo is unavailable), so the" >&2
+    echo "         independent tailnet path (C12) was NOT installed. Re-run as root." >&2
+    echo "         NB a sudoers policy granting only 'docker' is enough for every other step" >&2
+    echo "         of this install and not enough for this one." >&2
+    return 1
+  fi
+
+  local staged rc cid=""
+  staged="$(mktemp -d "${TMPDIR:-/tmp}/eyes-remote-access.XXXXXX")" || {
+    echo "WARNING: could not create a staging dir for the tailnet path." >&2
+    return 1
+  }
+
+  if ! cid="$($DOCKER create --platform "$PLATFORM" "$IMAGE" 2>/dev/null)" || [[ -z "$cid" ]]; then
+    echo "WARNING: could not create a container from $IMAGE to extract $RA_IMAGE_DIR/, so the" >&2
+    echo "         independent tailnet path (C12) was NOT installed." >&2
+    rm -rf "$staged"
+    return 1
+  fi
+  if ! $DOCKER cp "$cid:/app/$RA_IMAGE_DIR/." "$staged/" 2>/dev/null; then
+    echo "WARNING: $IMAGE has no /app/$RA_IMAGE_DIR — either this image predates C12, or the" >&2
+    echo "         directory was excluded from the build context. The independent tailnet" >&2
+    echo "         path was NOT installed. Check that docker/Dockerfile.app.dockerignore does" >&2
+    echo "         not list remote-access/ (it must not; see the note in that file)." >&2
+    $DOCKER rm -f "$cid" >/dev/null 2>&1 || true
+    rm -rf "$staged"
+    return 1
+  fi
+  $DOCKER rm -f "$cid" >/dev/null 2>&1 || true
+
+  if [[ ! -f "$staged/docker-compose.yml" || ! -f "$staged/scripts/install.sh" ]]; then
+    echo "WARNING: the extracted $RA_IMAGE_DIR/ is incomplete (missing docker-compose.yml or" >&2
+    echo "         scripts/install.sh). Refusing to install a partial rescue path." >&2
+    rm -rf "$staged"
+    return 1
+  fi
+  # `docker cp` preserves modes, but a tree that somehow arrived without them fails three
+  # layers down in a confusing way. Make the entry points executable regardless.
+  chmod 0755 "$staged"/scripts/*.sh "$staged"/forwarder/entrypoint.sh 2>/dev/null || true
+
+  echo "==> Installing the independent tailnet path from $IMAGE (/app/$RA_IMAGE_DIR)"
+  $as_root "$staged/scripts/install.sh"
+  rc=$?
+  rm -rf "$staged"
+  return "$rc"
+}
+
+if ! install_remote_access; then
+  echo "WARNING: the independent tailnet path (C12/RIS-101) is NOT installed on this node" >&2
+  echo "         — see above. The stack is up and this install is otherwise complete, but" >&2
+  echo "         reaching this box still depends entirely on the VMS vendor's tailnet." >&2
+  echo "         Until RIS-111 ships the per-device credential route, a node with no existing" >&2
+  echo "         /etc/eyes-remote-access/env cannot self-provision one; install by hand with" >&2
+  echo "         sudo <tree>/scripts/install.sh --env-file <file>" >&2
 fi
 
 echo "==> Node up: factory-id=$FACTORY_ID profile=$PROFILE release=$VERSION updater=$UPDATER_TAG."
