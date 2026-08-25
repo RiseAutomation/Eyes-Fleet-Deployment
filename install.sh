@@ -1318,10 +1318,13 @@ fi
 # IDEMPOTENT: the inner installer reuses an existing /etc/eyes-remote-access/env unless passed
 # --from-door, so a re-install neither re-mints a credential nor disturbs a live tunnel.
 #
-# UNTIL RIS-111 LANDS, a node with NO existing credential warns and continues: the inner
-# fetch-credential.sh still reads the fleet-wide EYES_TAILSCALE_AUTHKEY that RIS-109 dropped.
-# A node that already has /etc/eyes-remote-access/env converges silently — which is why this
-# is safe to run on Contempo today, and why it does nothing useful on Classique yet.
+# A NODE WITH NO CREDENTIAL MINTS ONE (C12/RIS-111): the inner fetch-credential.sh calls
+# POST /device/v1/remote-access/enroll, authenticated by this node's own device identity,
+# and the door returns a single-use 300s tag-scoped key. A node that already has
+# /etc/eyes-remote-access/env converges silently without re-minting.
+#
+# If the door has no Tailscale OAuth client mounted yet it answers 503 and this step warns
+# and continues, exactly as every other failure here does — never fatal.
 RA_IMAGE_DIR="${EYES_RA_IMAGE_DIR:-remote-access}" # where the tree lives INSIDE the image
 
 install_remote_access() {
