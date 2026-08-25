@@ -99,7 +99,13 @@
 #      reaching this box stops depending on a tailnet we do not control. The tree is lifted
 #      out of the app image (/app/remote-access/) and installed to /opt/eyes-remote-access
 #      with its own unit — SEPARATE LIFECYCLE, shared install moment only. Never fatal.
-#      (Steps 6 and 7 here are steps 7 and 8 in the body, which numbers the launch separately.)
+#   8. Provision `riseops` — RISE'S OWN root-capable SSH account (C12/RIS-108): our fleet
+#      public key for entry, a control-plane-minted PER-NODE password for `sudo` only, and a
+#      `Match User riseops` sshd drop-in that makes the account key-only. Idempotent on every
+#      run, and never fatal. The global `PasswordAuthentication` is deliberately untouched,
+#      because ssh_node.sh's password login is currently the fleet's only route in.
+#      (Steps 6, 7 and 8 here are steps 7, 8 and 9 in the body, which numbers the launch
+#      separately.)
 #
 # Tunables (env): EYES_HOME (default: current dir), EYES_IMAGE_TAG (default latest),
 #   EYES_ENROLL_CREDENTIAL (one-time device-enroll credential; may also be passed as the
@@ -112,6 +118,9 @@
 #   units, the script they run and their EnvironmentFile; default /etc/systemd/system,
 #   /usr/local/lib/eyes and /etc/eyes. Redirect them at a writable tree to install the units
 #   without root — which is also how the suite exercises this step).
+#   EYES_RISEOPS_USER / EYES_SSHD_CONF_DIR / EYES_RISEOPS_HOME (step 9's account name, the
+#   sshd drop-in directory and that account's home. Redirect the last two at a writable tree
+#   to exercise step 9 without root — which is how the suite tests it).
 #
 set -euo pipefail
 
@@ -585,12 +594,18 @@ else
 fi
 
 # ── 4. Fetch this node's resolved env from the control plane (A4-3, A4-D5) ────
-# The step that replaces the prd_fleet dump. GET /device/v1/config returns the eight (and
-# only eight) variables of this node's env that the control plane owns — the whole
-# ALLOWLIST in services/frontdoor/device_config.py — so the control-plane secrets that used
+# The step that replaces the prd_fleet dump. GET /device/v1/config returns ONLY the variables
+# of this node's env that the control plane owns — the whole ALLOWLIST in
+# services/frontdoor/device_config.py and nothing else — so the control-plane secrets that used
 # to land here (DATABASE_URL, and the ES256 signing key that could mint a token for ANY
-# device) are structurally unable to appear. The rest of the node's ten-variable env is
-# node-local: its release tag, registry, paths and machine id, written above and below.
+# device) are structurally unable to appear. The rest of the node's env is node-local: its
+# release tag, registry, paths and machine id, written above and below.
+#
+# NOTE (C12/RIS-108) the allowlist now also carries EYES_RISEOPS_AUTHORIZED_KEY and
+# EYES_RISEOPS_SUDO_PASSWORD, which step 9 consumes. The password is a ROOT-CAPABLE credential
+# and it lands in this file, so $ENV_FILE is chmod 600 below and the updater's
+# _write_release_env writes a second 0600 copy on every bump. Two root-owned 0600 files, which
+# is the tradeoff RIS-108 accepted explicitly rather than discovering later.
 #
 # Run inside the app image because it needs the Ed25519 key + a JWT library to mint the
 # bearer, neither of which exists on the host. It is bearer-only by design: by now the node
@@ -1318,10 +1333,13 @@ fi
 # IDEMPOTENT: the inner installer reuses an existing /etc/eyes-remote-access/env unless passed
 # --from-door, so a re-install neither re-mints a credential nor disturbs a live tunnel.
 #
-# UNTIL RIS-111 LANDS, a node with NO existing credential warns and continues: the inner
-# fetch-credential.sh still reads the fleet-wide EYES_TAILSCALE_AUTHKEY that RIS-109 dropped.
-# A node that already has /etc/eyes-remote-access/env converges silently — which is why this
-# is safe to run on Contempo today, and why it does nothing useful on Classique yet.
+# A NODE WITH NO CREDENTIAL MINTS ONE (C12/RIS-111): the inner fetch-credential.sh calls
+# POST /device/v1/remote-access/enroll, authenticated by this node's own device identity,
+# and the door returns a single-use 300s tag-scoped key. A node that already has
+# /etc/eyes-remote-access/env converges silently without re-minting.
+#
+# If the door has no Tailscale OAuth client mounted yet it answers 503 and this step warns
+# and continues, exactly as every other failure here does — never fatal.
 RA_IMAGE_DIR="${EYES_RA_IMAGE_DIR:-remote-access}" # where the tree lives INSIDE the image
 
 install_remote_access() {
@@ -1394,9 +1412,290 @@ if ! install_remote_access; then
   echo "WARNING: the independent tailnet path (C12/RIS-101) is NOT installed on this node" >&2
   echo "         — see above. The stack is up and this install is otherwise complete, but" >&2
   echo "         reaching this box still depends entirely on the VMS vendor's tailnet." >&2
-  echo "         Until RIS-111 ships the per-device credential route, a node with no existing" >&2
-  echo "         /etc/eyes-remote-access/env cannot self-provision one; install by hand with" >&2
+  echo "         The node normally mints its own credential from the device door; if that is" >&2
+  echo "         what failed, the message above says which of the three causes it was (no" >&2
+  echo "         OAuth client on the door, remote access disabled for this device, or the" >&2
+  echo "         door unreachable). To configure by hand instead:" >&2
   echo "         sudo <tree>/scripts/install.sh --env-file <file>" >&2
+fi
+
+# ── 9. Rise's own SSH account: `riseops` (C12/RIS-108) ───────────────────────
+#
+# C12's exit criterion is "`ssh <user>@eyes-<site>` gets a shell on the host". If that user is
+# the VMS vendor's, our "independent" path still rests on a credential the vendor can rotate —
+# the tunnel would be ours and the login would not. So every node gets a Rise-owned,
+# root-capable account, created HERE rather than by hand, so that it exists on nodes nobody has
+# ever SSH'd into.
+#
+# TWO CREDENTIALS, DELIBERATELY, WITH DIFFERENT JOBS:
+#   * the fleet Ed25519 PUBLIC key (EYES_RISEOPS_AUTHORIZED_KEY) — SSH ENTRY. One key on every
+#     node; its private half lives in Doppler `fleet-access`/`prd` and never touches a node.
+#   * a PER-NODE password (EYES_RISEOPS_SUDO_PASSWORD) — `sudo` ONLY, after entry. Minted by the
+#     device door on this node's first /config poll, so no human ever handles it. Per-node
+#     because a shared sudo password would make one node's compromise root on all of them.
+# Both arrive through the release env step 4 just wrote, which is the point: one delivery
+# channel, and the values are already on the box before this step runs.
+#
+# WHY `riseops` MUST NOT ACCEPT PASSWORD SSH, and why THE PASSWORD IS THE LAST THING THIS STEP
+# DOES. The password is stored in the registry in PLAINTEXT — it cannot be hashed, because a
+# human has to type it at a `sudo` prompt (migration 0005). That is only acceptable while it is
+# not also an ENTRY credential: sshd listens on 0.0.0.0:22, reachable from the site LAN and from
+# the vendor's tailnet, where three vendor-controlled machines can reach Contempo's :22 today. If
+# `riseops` took passwords, one Cloud SQL leak would be remote root on the fleet.
+#
+# The sub-steps therefore run in RIS-108's order — the account and its key first (9a, 9b), then
+# the `Match User` drop-in (9c) — with ONE dependency layered on top that RIS-108 did not have to
+# state, because RIS-108 never mentions the password: the drop-in GATES the password. If the
+# drop-in could not be written, validated and reloaded, THE PASSWORD IS NOT SET AT ALL (9d). The
+# account is then reachable BY KEY and cannot `sudo` — the safe half-state — rather than a
+# password-accepting account whose plaintext copy sits in Cloud SQL.
+#
+# Do not reorder 9c and 9d to "finish the account in one pass". That ordering was tried and
+# reverted (C12-2, 2026-08-24): it makes the gate unreachable, and the gate is the whole reason
+# the plaintext column was acceptable in the first place.
+#
+# NEVER TOUCH THE GLOBAL `PasswordAuthentication`. It stays `yes`, deliberately: scripts/
+# ssh_node.sh authenticates to these boxes with a PASSWORD (`sshpass -e ssh`, credentials from
+# Doppler `fleet-access`), and it is the fleet's only current route in. A global flip would
+# sever the lifeline on machines nobody can walk to. A `Match User riseops` block satisfies the
+# intent for the account this step creates and leaves the vendor's door alone.
+#
+# `sshd -t` BEFORE ANY RELOAD, and `reload`, NEVER `restart`. A bad sshd config that is merely
+# loaded costs little (existing connections survive, and `-t` catches it first); a bad one that
+# RESTARTS the daemon on a box with no console is the node gone. On a `-t` failure the previous
+# state of the drop-in is restored and nothing is reloaded.
+#
+# THIS STEP MAY NEVER FAIL THE INSTALL, for the same reason 6b's move-aside is last: install.sh
+# is the documented escape from a node that can run neither release, and a node that cannot
+# reinstall because a `useradd` failed is a node we have bricked. Every failure below is a
+# WARNING and the install continues.
+#
+# IDEMPOTENT, one code path for existing and new nodes (Contempo already has this account,
+# provisioned by hand — RIS-108). Re-running converges: the user is created only if absent,
+# authorized_keys is compared before writing, and the drop-in is left untouched — and NOT
+# reloaded — when its content already matches.
+RISEOPS_USER="${EYES_RISEOPS_USER:-riseops}"
+SSHD_CONF_DIR="${EYES_SSHD_CONF_DIR:-/etc/ssh/sshd_config.d}"
+RISEOPS_DROPIN="$SSHD_CONF_DIR/60-riseops.conf"
+
+# The whole content of the drop-in. The `Match` block is the LAST thing in the file and nothing
+# follows it, because `Match` state persists to end-of-file — see RIS-108 on the `Include` at
+# line 12 of sshd_config with six live directives after it. (Verified empirically on OpenSSH
+# 9.6p1: active/inactive state is restored on return from an Include, so this is safe. Recorded
+# because the next person will look at that line and worry.)
+riseops_dropin_content() {
+  cat <<RISEOPS_SSHD_CONF
+# Managed by scripts/install.sh (Eyes, C12/RIS-108). Rewritten on every install.
+#
+# The $RISEOPS_USER account's sudo password is stored in the control-plane registry in
+# PLAINTEXT, because a human has to type it at a sudo prompt. That is only safe while this
+# account cannot be ENTERED with that password: sshd listens on 0.0.0.0:22, reachable from the
+# site LAN and from the VMS vendor's tailnet, so a password-accepting $RISEOPS_USER would turn
+# one database leak into remote root on the whole fleet.
+#
+# The GLOBAL PasswordAuthentication deliberately stays 'yes' — scripts/ssh_node.sh logs into
+# this box with a password and is currently its only route in. Do not "tidy" that up here.
+#
+# Revert: rm this file, sshd -t, systemctl reload ssh.
+Match User $RISEOPS_USER
+    PasswordAuthentication no
+RISEOPS_SSHD_CONF
+}
+
+install_riseops_account() {
+  if [[ ! -f "$ENV_FILE" ]]; then
+    echo "WARNING: no release env, so the $RISEOPS_USER account was not provisioned." >&2
+    return 1
+  fi
+  local pubkey password
+  # Last occurrence wins, exactly as compose and layout.read_env read this file.
+  pubkey="$(sed -n 's/^EYES_RISEOPS_AUTHORIZED_KEY=//p' "$ENV_FILE" | tail -n1)"
+  password="$(sed -n 's/^EYES_RISEOPS_SUDO_PASSWORD=//p' "$ENV_FILE" | tail -n1)"
+
+  if [[ -z "$pubkey" ]]; then
+    echo "WARNING: /config served no EYES_RISEOPS_AUTHORIZED_KEY, so Rise's own SSH account" >&2
+    echo "         ($RISEOPS_USER) was NOT provisioned on this node. Our independent access" >&2
+    echo "         path (C12) therefore still rests on the VMS vendor's account here." >&2
+    echo "         Set EYES_RISEOPS_AUTHORIZED_KEY on the device door and re-run" >&2
+    echo "         (deploy/frontdoor/deploy-device-door.sh, C12/RIS-108)." >&2
+    return 1
+  fi
+  if ! command -v useradd >/dev/null 2>&1; then
+    echo "WARNING: no useradd on this host, so the $RISEOPS_USER account was not created." >&2
+    return 1
+  fi
+
+  # Root, or a working sudo. Probed with a REAL WRITE into the sshd conf dir rather than
+  # `mkdir -p`, which succeeds on an existing directory whether or not it is writable — the
+  # same probe shape step 1 uses for the docker daemon.
+  local as_root="" probe
+  probe="$SSHD_CONF_DIR/.eyes-write-probe.$$"
+  if mkdir -p "$SSHD_CONF_DIR" 2>/dev/null && : > "$probe" 2>/dev/null; then
+    rm -f "$probe"
+  elif command -v sudo >/dev/null 2>&1 && sudo mkdir -p "$SSHD_CONF_DIR" 2>/dev/null; then
+    as_root="sudo"
+  else
+    echo "WARNING: cannot write $SSHD_CONF_DIR (not root, and sudo is unavailable), so the" >&2
+    echo "         $RISEOPS_USER account was not provisioned. Re-run this install as root." >&2
+    echo "         NB a sudoers policy granting only 'docker' is enough for every other step" >&2
+    echo "         of this install and not enough for this one." >&2
+    return 1
+  fi
+
+  # ---- 9a. the account ----
+  if id -u "$RISEOPS_USER" >/dev/null 2>&1; then
+    echo "==> Account $RISEOPS_USER already exists — leaving the account itself alone."
+  elif $as_root useradd --create-home --shell /bin/bash "$RISEOPS_USER"; then
+    echo "==> Created $RISEOPS_USER."
+  else
+    # Returning here also means 9c never writes the drop-in, and that is correct rather than a
+    # gap: `Match User riseops` is inert with no such user, and a node that failed `useradd` has
+    # no account to restrict. The reverse order would leave a live sshd edit behind for an
+    # account that does not exist.
+    echo "WARNING: could not create $RISEOPS_USER; Rise's own SSH access to this node is not" >&2
+    echo "         provisioned." >&2
+    return 1
+  fi
+
+  # The `sudo` GROUP, and deliberately not a NOPASSWD sudoers rule. NOPASSWD is a LARGER grant
+  # than a password: the fleet key has no passphrase, so possession of that one file would
+  # become instant root with no second factor. Adding a user to a group it is in is a no-op.
+  $as_root usermod -aG sudo "$RISEOPS_USER" \
+    || echo "WARNING: could not add $RISEOPS_USER to the sudo group." >&2
+
+  # ---- 9b. authorized_keys ----
+  local home ssh_dir auth_keys staged_keys
+  home="${EYES_RISEOPS_HOME:-}"
+  if [[ -z "$home" ]] && command -v getent >/dev/null 2>&1; then
+    home="$(getent passwd "$RISEOPS_USER" | cut -d: -f6)"
+  fi
+  home="${home:-/home/$RISEOPS_USER}"
+  ssh_dir="$home/.ssh"
+  auth_keys="$ssh_dir/authorized_keys"
+
+  # WRITTEN WHOLESALE, not appended, and that is a decision rather than a shortcut: this account
+  # exists so that "who holds root-capable access to the fleet" has ONE answer. An
+  # authorized_keys that accumulates is an authorized_keys nobody can audit. If you need your
+  # own key on a node, use the vendor account or add yours to the fleet key's custody — do not
+  # expect a hand-added line here to survive the next install.
+  staged_keys="$(mktemp)"
+  {
+    echo "# Managed by scripts/install.sh (Eyes, C12/RIS-108). Rewritten on every install:"
+    echo "# anything added here by hand is LOST on the next one, on purpose — this account's"
+    echo "# key set is a fleet-wide fact, not a per-node accumulation."
+    printf '%s\n' "$pubkey"
+  } > "$staged_keys"
+
+  if $as_root test -f "$auth_keys" && $as_root cmp -s "$staged_keys" "$auth_keys"; then
+    echo "==> $auth_keys already current."
+  elif $as_root mkdir -p "$ssh_dir" && $as_root install -m 0600 "$staged_keys" "$auth_keys"; then
+    echo "==> Installed the fleet public key for $RISEOPS_USER."
+  else
+    echo "WARNING: could not install $auth_keys." >&2
+  fi
+  rm -f "$staged_keys"
+  # sshd REFUSES a key whose ownership it does not trust, so these two lines are not tidiness:
+  # .ssh must be 0700 and owned by the user, authorized_keys 0600 and owned by the user, or key
+  # auth silently fails with nothing in the client's output to say why.
+  $as_root chmod 0700 "$ssh_dir" || echo "WARNING: could not chmod 0700 $ssh_dir." >&2
+  $as_root chown -R "$RISEOPS_USER:$RISEOPS_USER" "$ssh_dir" \
+    || echo "WARNING: could not chown $ssh_dir to $RISEOPS_USER — sshd will REFUSE the key." >&2
+
+  # ---- 9c. sshd: key-only for THIS account. Runs BEFORE 9d, and gates it. ----
+  local sshd_bin sshd_ok=0
+  sshd_bin="$(command -v sshd 2>/dev/null || true)"
+  if [[ -z "$sshd_bin" && -x /usr/sbin/sshd ]]; then sshd_bin=/usr/sbin/sshd; fi
+
+  local staged_conf backup="" had_dropin=0
+  staged_conf="$(mktemp)"
+  riseops_dropin_content > "$staged_conf"
+
+  if [[ -z "$sshd_bin" ]]; then
+    echo "WARNING: no sshd binary found, so $RISEOPS_DROPIN was NOT written and could not be" >&2
+    echo "         validated. NOT setting a sudo password: without the key-only restriction" >&2
+    echo "         the registry's plaintext copy would be a REMOTE ENTRY credential for this" >&2
+    echo "         node (C12/RIS-108). The account and its key are installed regardless." >&2
+  elif $as_root test -f "$RISEOPS_DROPIN" && $as_root cmp -s "$staged_conf" "$RISEOPS_DROPIN"; then
+    # Already exactly right — no write, and specifically NO RELOAD. A reload nobody needed is
+    # still a reload of the daemon that is this node's only route in.
+    echo "==> $RISEOPS_DROPIN already current — sshd untouched."
+    sshd_ok=1
+  else
+    if $as_root test -f "$RISEOPS_DROPIN"; then
+      had_dropin=1
+      backup="$(mktemp)"
+      $as_root cat "$RISEOPS_DROPIN" > "$backup" 2>/dev/null || backup=""
+    fi
+    if ! $as_root install -m 0644 "$staged_conf" "$RISEOPS_DROPIN"; then
+      echo "WARNING: could not write $RISEOPS_DROPIN; not setting a sudo password." >&2
+    elif ! $as_root "$sshd_bin" -t; then
+      # The whole reason -t runs before any reload. Put the file back the way it was and do NOT
+      # reload: a config that fails validation must never reach the running daemon.
+      echo "WARNING: 'sshd -t' FAILED with $RISEOPS_DROPIN in place. Reverting it and NOT" >&2
+      echo "         reloading sshd. Nothing about this box's SSH access has changed." >&2
+      if [[ "$had_dropin" == "1" && -n "$backup" ]]; then
+        $as_root install -m 0644 "$backup" "$RISEOPS_DROPIN" || true
+      else
+        $as_root rm -f "$RISEOPS_DROPIN" || true
+      fi
+      $as_root "$sshd_bin" -t \
+        || echo "WARNING: sshd -t still fails — this host's sshd config was ALREADY broken." >&2
+    else
+      # RELOAD, NEVER RESTART: a restart on a box with no console is the node gone if anything
+      # about the daemon's startup has drifted. Debian/Ubuntu name the unit `ssh`, RHEL `sshd`;
+      # try both, and treat "no systemctl" as non-fatal — the file is valid and correct, it just
+      # is not live until something reloads or the box reboots.
+      sshd_ok=1
+      if command -v systemctl >/dev/null 2>&1; then
+        if $as_root systemctl reload sshd 2>/dev/null || $as_root systemctl reload ssh 2>/dev/null; then
+          echo "==> $RISEOPS_DROPIN installed; sshd reloaded ($RISEOPS_USER is key-only)."
+        else
+          echo "WARNING: $RISEOPS_DROPIN is written and VALID, but reloading sshd failed. It" >&2
+          echo "         takes effect at the next reload or reboot. NOT restarting sshd." >&2
+        fi
+      else
+        echo "WARNING: no systemctl; $RISEOPS_DROPIN is valid but not yet live." >&2
+      fi
+    fi
+  fi
+  rm -f "$staged_conf"
+  [[ -z "$backup" ]] || rm -f "$backup"
+
+  # ---- 9d. the sudo password ----
+  if [[ "$sshd_ok" != "1" ]]; then
+    echo "WARNING: skipping the $RISEOPS_USER sudo password because the key-only sshd" >&2
+    echo "         restriction is not in place — see above. The account is reachable by KEY" >&2
+    echo "         and cannot sudo until this is fixed and install.sh is re-run. That is the" >&2
+    echo "         safe half-state: setting the password now would make the registry's" >&2
+    echo "         plaintext copy a remote ENTRY credential for this node." >&2
+  elif [[ -z "$password" ]]; then
+    echo "WARNING: /config served no EYES_RISEOPS_SUDO_PASSWORD, so $RISEOPS_USER cannot sudo" >&2
+    echo "         on this node. The door mints it on the node's first /config poll" >&2
+    echo "         (C12/RIS-108); check the device door has migration 0005 applied, then" >&2
+    echo "         re-run install.sh. SSH entry by key works regardless." >&2
+  # STDIN, NEVER argv: an argument is visible in `ps` to every user on the box for the life of
+  # the process, and `$as_root` may be `sudo`, which makes it a separate process. `printf` is a
+  # bash builtin, so the value never becomes another process's argv either.
+  #
+  # Set on EVERY run, not only at creation, so the door stays authoritative and a password
+  # changed by hand on the box converges back. The cost: /etc/shadow's hash gets a fresh salt on
+  # each install even when nothing changed, so this one sub-step is idempotent in EFFECT rather
+  # than byte-for-byte. That was the right trade — the alternative is "the box wins", and then
+  # the value an engineer reads out of the fleet UI is not the one that works.
+  elif printf '%s:%s\n' "$RISEOPS_USER" "$password" | $as_root chpasswd; then
+    echo "==> Set the $RISEOPS_USER sudo password from the control plane."
+  else
+    echo "WARNING: could not set the $RISEOPS_USER sudo password (chpasswd failed)." >&2
+  fi
+  unset password
+  return 0
+}
+
+if ! install_riseops_account; then
+  echo "WARNING: Rise's own SSH account ($RISEOPS_USER) is NOT fully provisioned on this node" >&2
+  echo "         — see above. The stack is up and this install is otherwise complete, but" >&2
+  echo "         C12's independent access path does not exist here yet, so remote access to" >&2
+  echo "         this box still depends on the VMS vendor's account (RIS-108)." >&2
 fi
 
 echo "==> Node up: factory-id=$FACTORY_ID profile=$PROFILE release=$VERSION updater=$UPDATER_TAG."
