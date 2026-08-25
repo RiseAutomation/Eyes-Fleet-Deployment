@@ -1397,8 +1397,10 @@ if ! install_remote_access; then
   echo "WARNING: the independent tailnet path (C12/RIS-101) is NOT installed on this node" >&2
   echo "         — see above. The stack is up and this install is otherwise complete, but" >&2
   echo "         reaching this box still depends entirely on the VMS vendor's tailnet." >&2
-  echo "         Until RIS-111 ships the per-device credential route, a node with no existing" >&2
-  echo "         /etc/eyes-remote-access/env cannot self-provision one; install by hand with" >&2
+  echo "         The node normally mints its own credential from the device door; if that is" >&2
+  echo "         what failed, the message above says which of the three causes it was (no" >&2
+  echo "         OAuth client on the door, remote access disabled for this device, or the" >&2
+  echo "         door unreachable). To configure by hand instead:" >&2
   echo "         sudo <tree>/scripts/install.sh --env-file <file>" >&2
 fi
 
