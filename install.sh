@@ -104,8 +104,10 @@
 #      `Match User riseops` sshd drop-in that makes the account key-only. Idempotent on every
 #      run, and never fatal. The global `PasswordAuthentication` is deliberately untouched,
 #      because ssh_node.sh's password login is currently the fleet's only route in.
-#      (Steps 6, 7 and 8 here are steps 7, 8 and 9 in the body, which numbers the launch
-#      separately.)
+#   9. Take thermald out of the loop: mask it and clear the CPU limits it set. On this
+#      fleet's boards it throttles a cool CPU to ~15% of its speed. Never fatal; opt out with
+#      EYES_KEEP_THERMALD=1.
+#      (Steps 6–9 here are steps 7–10 in the body, which numbers the launch separately.)
 #
 # Tunables (env): EYES_HOME (default: current dir), EYES_IMAGE_TAG (default latest),
 #   EYES_ENROLL_CREDENTIAL (one-time device-enroll credential; may also be passed as the
@@ -1696,6 +1698,103 @@ if ! install_riseops_account; then
   echo "         — see above. The stack is up and this install is otherwise complete, but" >&2
   echo "         C12's independent access path does not exist here yet, so remote access to" >&2
   echo "         this box still depends on the VMS vendor's account (RIS-108)." >&2
+fi
+
+# ── 10. CPU thermal policy: take thermald out of the loop ────────────────────
+# Found on Groupe Classic 2026-09-23 (Intel Core Ultra 5 225, B860 board, Ubuntu 24.04): the
+# node was running at 9 W and ~700 MHz under a load of 18 on 10 cores, with the package at
+# 47°C. thermald — installed and enabled by default on Ubuntu, and started `--adaptive` — had
+# walked its whole cooling ladder to the end: RAPL PL1 cut 65 → 32 W, intel_pstate
+# max_perf_pct 16 and no_turbo 1, intel_powerclamp injecting 49% idle, every ACPI Processor
+# cooling device at 3/3. This board ships no DPTF tables for adaptive mode and bogus ACPI
+# trips (a "critical" zone at 20°C, package passive trips at -274°C), so thermald believes
+# the CPU is overheating from the moment it starts, every boot. Detection ran ~50x slower
+# than the same model on a laptop.
+#
+# Stopping thermald is not enough: it does not undo its settings on exit (verified on the
+# node), and it comes back at the next boot. So: mask it (disable would still let D-Bus
+# activation or a package upgrade restart it), and — only when it was actually running —
+# clear what it left behind so the fix lands without a reboot. The CPU's own protection
+# (TCC/PROCHOT near TjMax) is untouched and is what guards a desktop with a real cooler.
+#
+# Opt out on a box that genuinely needs thermald: EYES_KEEP_THERMALD=1.
+# THIS STEP MAY NEVER FAIL THE INSTALL (step 7's reason). Idempotent: on a node already
+# masked it only reports so.
+SYSFS_ROOT="${EYES_SYSFS_ROOT:-/sys}"
+
+cpu_root_cmd() {
+  # Run a command as root: directly if we are root, else via sudo if available.
+  if [[ "$(id -u)" == "0" ]]; then "$@"
+  elif command -v sudo >/dev/null 2>&1; then sudo "$@"
+  else return 1
+  fi
+}
+
+cpu_write() { # <value> <sysfs file> — direct if writable (tests, root), else via root.
+  [[ -e "$2" ]] || return 0
+  if [[ -w "$2" ]]; then printf '%s\n' "$1" > "$2" 2>/dev/null && return 0; fi
+  printf '%s\n' "$1" | cpu_root_cmd tee "$2" >/dev/null 2>&1
+}
+
+reset_thermald_leftovers() {
+  local pstate="$SYSFS_ROOT/devices/system/cpu/intel_pstate"
+  local rapl="$SYSFS_ROOT/class/powercap/intel-rapl:0"
+  local cpu0="$SYSFS_ROOT/devices/system/cpu/cpu0/cpufreq"
+  cpu_write 0 "$pstate/no_turbo"
+  cpu_write 100 "$pstate/max_perf_pct"
+  if [[ -r "$cpu0/cpuinfo_min_freq" && -r "$cpu0/cpuinfo_max_freq" ]]; then
+    cpu_write $(( $(cat "$cpu0/cpuinfo_min_freq") * 100 / $(cat "$cpu0/cpuinfo_max_freq") )) "$pstate/min_perf_pct"
+  fi
+  if [[ -r "$rapl/constraint_0_max_power_uw" ]]; then
+    local max_uw; max_uw="$(cat "$rapl/constraint_0_max_power_uw")"
+    [[ "$max_uw" =~ ^[0-9]+$ && "$max_uw" -gt 0 ]] && cpu_write "$max_uw" "$rapl/constraint_0_power_limit_uw"
+  fi
+  local d t
+  for d in "$SYSFS_ROOT"/class/thermal/cooling_device*; do
+    [[ -r "$d/type" ]] || continue
+    t="$(cat "$d/type")"
+    [[ "$t" == "intel_powerclamp" || "$t" == "Processor" ]] && cpu_write 0 "$d/cur_state"
+  done
+  return 0
+}
+
+install_cpu_policy() {
+  if [[ "${EYES_KEEP_THERMALD:-}" == "1" ]]; then
+    echo "==> EYES_KEEP_THERMALD=1: leaving thermald as it is."
+    return 0
+  fi
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 0 # no systemd, so no thermald unit to manage
+  fi
+  local state active
+  state="$(systemctl is-enabled thermald.service 2>/dev/null || true)"
+  if [[ -z "$state" || "$state" == "not-found" ]]; then
+    return 0 # thermald not installed
+  fi
+  if [[ "$state" == "masked" ]]; then
+    echo "==> thermald is masked (CPU throttling fix already in place)."
+    return 0
+  fi
+  active="$(systemctl is-active thermald.service 2>/dev/null || true)"
+  if ! { systemctl disable --now thermald.service >/dev/null 2>&1 \
+         || cpu_root_cmd systemctl disable --now thermald.service >/dev/null 2>&1; }; then
+    echo "WARNING: could not stop thermald, which throttles this CPU hard on boards with bogus" >&2
+    echo "         ACPI thermal data. By hand: sudo systemctl disable --now thermald && sudo systemctl mask thermald" >&2
+    return 1
+  fi
+  systemctl mask thermald.service >/dev/null 2>&1 || cpu_root_cmd systemctl mask thermald.service >/dev/null 2>&1 || true
+  if [[ "$active" == "active" ]]; then
+    reset_thermald_leftovers
+    echo "==> Masked thermald and cleared the CPU limits it had set (power limit, max perf, turbo, idle injection)."
+  else
+    echo "==> Masked thermald (it was not running, so no CPU limits needed clearing)."
+  fi
+  return 0
+}
+
+if ! install_cpu_policy; then
+  echo "WARNING: thermald is still managing this CPU — see above. The stack is up and this" >&2
+  echo "         install is otherwise complete, but detection may run heavily throttled." >&2
 fi
 
 echo "==> Node up: factory-id=$FACTORY_ID profile=$PROFILE release=$VERSION updater=$UPDATER_TAG."
